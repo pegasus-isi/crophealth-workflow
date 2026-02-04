@@ -13,7 +13,7 @@ Image Source → Fetch/Catalog Images → Preprocess Images → Train Classifier
                                                                │
                         ┌──────────────────────────────────────┘
                         ↓
-               Classify Diseases → Generate Report → HTML + Charts + JSON
+               Classify Diseases → Evaluate Accuracy → Generate Report → HTML + Charts + JSON
 ```
 
 ### DAG Visualization
@@ -29,7 +29,7 @@ With `--enable-dpu`, the workflow distributes processing across edge and cloud:
 ```
 Edge (DPU):   Fetch Images → Preprocess    (I/O intensive)
                     ↓
-Cloud (CPU/GPU):  Train → Classify → Report  (compute intensive)
+Cloud (CPU/GPU):  Train → Classify → Evaluate → Report  (compute intensive)
 ```
 
 **Benefits:**
@@ -45,8 +45,9 @@ Cloud (CPU/GPU):  Train → Classify → Report  (compute intensive)
 - **Severity scoring**: Critical, High, Moderate, Low, None
 - **Treatment recommendations**: Actionable guidance for each disease
 - **Fertilizer guidance**: Crop-specific fertilizer recommendations
-- **Rich visualizations**: Distribution charts, confidence histograms
-- **HTML reports**: Professional reports with all findings
+- **Accuracy evaluation**: Per-class precision, recall, F1, and confusion matrix
+- **Rich visualizations**: Distribution charts, confidence histograms, confusion matrix heatmap
+- **HTML reports**: Professional reports with all findings including accuracy metrics
 - **Edge-to-Cloud**: Optional DPU-accelerated workflow for FABRIC deployments
 
 ## Running on ACCESS
@@ -177,6 +178,7 @@ crophealth-workflow/
 │   ├── preprocess_images.py       # Image preprocessing and augmentation
 │   ├── train_classifier.py        # CNN model training
 │   ├── classify_disease.py        # Disease inference
+│   ├── evaluate_accuracy.py       # Accuracy evaluation against ground truth
 │   └── generate_report.py         # Report generation
 ├── Docker/
 │   └── CropHealth_Dockerfile      # Multi-platform container
@@ -277,11 +279,13 @@ output/
 ├── val_data.npz                  # Preprocessed validation data
 ├── disease_classifier.pt         # Trained model
 ├── predictions.json              # Disease predictions
+├── accuracy_results.json         # Accuracy metrics and confusion matrix
 ├── report/
-│   ├── report.html               # HTML report
+│   ├── report.html               # HTML report with accuracy metrics
 │   ├── disease_distribution.png  # Disease distribution chart
 │   ├── severity_distribution.png # Severity chart
-│   └── crop_health_summary.png   # Crop-wise summary
+│   ├── crop_health_summary.png   # Crop-wise summary
+│   └── confusion_matrix.png      # Confusion matrix heatmap
 ```
 
 ## Helper Scripts
@@ -397,11 +401,36 @@ Note: You must accept the dataset terms at https://www.kaggle.com/datasets/emmar
 }
 ```
 
+### Accuracy Results JSON
+
+```json
+{
+  "evaluated_at": "2026-02-04T12:00:00",
+  "overall_accuracy": 0.95,
+  "total_evaluated": 4627,
+  "correct": 4400,
+  "incorrect": 227,
+  "unmatched": 0,
+  "per_class": {
+    "Pepper__bell___Bacterial_spot": {
+      "total": 997, "correct": 980, "accuracy": 0.983,
+      "precision": 0.98, "recall": 0.983, "f1": 0.981
+    }
+  },
+  "confusion_matrix": {
+    "labels": ["Pepper__bell___Bacterial_spot", "..."],
+    "matrix": [[980, 5], [3, 500]]
+  }
+}
+```
+
 ### HTML Report
 
 Interactive HTML report with:
 - Summary statistics
 - Critical alerts
+- Accuracy metrics (overall and per-class precision/recall/F1)
+- Confusion matrix heatmap
 - Disease distribution charts
 - Severity breakdown
 - Treatment recommendations

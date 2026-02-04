@@ -199,6 +199,7 @@ class CropHealthWorkflow:
         severity_distribution_png = File("severity_distribution.png")
         crop_health_summary_png = File("crop_health_summary.png")
         confidence_histogram_png = File("confidence_histogram.png")
+        confusion_matrix_png = File("confusion_matrix.png")
 
         # Job 1: Fetch/catalog images
         fetch_job = Job("fetch_crop_images", _id="fetch_images", node_label="fetch_images")
@@ -285,6 +286,7 @@ class CropHealthWorkflow:
         report_job.add_outputs(severity_distribution_png, stage_out=True, register_replica=False)
         report_job.add_outputs(crop_health_summary_png, stage_out=True, register_replica=False)
         report_job.add_outputs(confidence_histogram_png, stage_out=True, register_replica=False)
+        report_job.add_outputs(confusion_matrix_png, stage_out=True, register_replica=False)
         report_job.add_pegasus_profile(label="report")
 
         # Add jobs to workflow
