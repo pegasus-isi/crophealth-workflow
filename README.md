@@ -49,6 +49,69 @@ Cloud (CPU/GPU):  Train → Classify → Report  (compute intensive)
 - **HTML reports**: Professional reports with all findings
 - **Edge-to-Cloud**: Optional DPU-accelerated workflow for FABRIC deployments
 
+## Running on ACCESS
+
+The easiest way to run this workflow is using the provided Jupyter notebook on an ACCESS resource with Pegasus and HTCondor pre-configured:
+
+**Notebook**: [`Access-CropHealth-workflow.ipynb`](Access-CropHealth-workflow.ipynb)
+
+The notebook walks through the complete workflow: configuring parameters, generating the Pegasus DAG, submitting to HTCondor, monitoring execution, and examining results with inline visualizations.
+
+## Running on FABRIC
+
+The workflow can also be run on the [FABRIC testbed](https://fabric-testbed.net/) by first deploying a distributed Pegasus/HTCondor cluster across FABRIC sites.
+
+### Step 1: Deploy a Pegasus/HTCondor Cluster
+
+#### Option 1: FABRIC Artifact (Recommended)
+
+Download and run the pre-configured Pegasus-FABRIC notebook from the FABRIC Artifacts repository:
+
+**Artifact URL**: https://artifacts.fabric-testbed.net/artifacts/53da4088-a175-4f0c-9e25-a4a371032a39
+
+This artifact contains a complete setup for deploying a distributed Pegasus/HTCondor infrastructure across FABRIC sites.
+
+#### Option 2: Jupyter Examples Repository
+
+Use the Pegasus-FABRIC notebook from the official FABRIC Jupyter examples:
+
+**GitHub**: https://github.com/fabric-testbed/jupyter-examples/blob/f7be0c75f22544c72d7b3e3fa42bbdfd9d8bb841/fabric_examples/complex_recipes/pegasus/pegasus-fabric.ipynb
+
+#### Cluster Architecture
+
+The notebook provisions:
+- **Submit Node**: Central Manager running HTCondor scheduler and Pegasus WMS
+- **Worker Nodes**: Distributed execution points across multiple FABRIC sites
+- **FABNetv4 Networking**: Private L3 network connecting all nodes
+
+#### Setup Steps
+
+1. Log into the [FABRIC JupyterHub](https://jupyter.fabric-testbed.net/)
+2. Upload/clone the Pegasus-FABRIC notebook
+3. Configure your desired sites and node specifications
+4. Run the notebook to provision the cluster
+5. Clone this repository on the submit node
+6. Run the workflow using the CLI or the Access notebook
+
+### Step 2: Run the Workflow
+
+SSH to the submit node and run:
+
+```bash
+cd crophealth-workflow
+
+# Generate workflow
+./workflow_generator.py \
+    --data-source kaggle \
+    --kaggle-dataset emmarex/plantdisease \
+    --image-size 128 \
+    --epochs 10 \
+    --output workflow.yml
+
+# Submit to HTCondor
+pegasus-plan --submit -s condorpool -o local workflow.yml
+```
+
 ## Prerequisites
 
 ### Software Requirements
