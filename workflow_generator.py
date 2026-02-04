@@ -8,7 +8,8 @@ Creates a workflow for:
 2. Preprocessing images for ML
 3. Training disease classification model
 4. Running inference on new images
-5. Generating health reports
+5. Evaluating classification accuracy
+6. Generating health reports
 
 Supports standard single-site execution and edge-to-cloud DPU architecture.
 
@@ -150,6 +151,14 @@ class CropHealthWorkflow:
             container=crophealth_container,
         ).add_pegasus_profile(memory="32 GB")
 
+        evaluate_accuracy = Transformation(
+            "evaluate_accuracy",
+            site=exec_site_name,
+            pfn=os.path.join(self.wf_dir, "bin/evaluate_accuracy.py"),
+            is_stageable=True,
+            container=crophealth_container,
+        ).add_pegasus_profile(memory="4 GB")
+
         generate_report = Transformation(
             "generate_report",
             site=exec_site_name,
@@ -164,6 +173,7 @@ class CropHealthWorkflow:
             preprocess_images,
             train_classifier,
             classify_disease,
+            evaluate_accuracy,
             generate_report,
         )
 
@@ -182,6 +192,7 @@ class CropHealthWorkflow:
         model_checkpoint = File("disease_classifier.pt")
         training_info = File("training_info.json")
         predictions_file = File("predictions.json")
+        accuracy_results = File("accuracy_results.json")
         report_html = File("report.html")
         report_summary = File("report_summary.json")
         disease_distribution_png = File("disease_distribution.png")
@@ -248,14 +259,26 @@ class CropHealthWorkflow:
         classify_job.add_outputs(predictions_file, stage_out=True, register_replica=False)
         classify_job.add_pegasus_profile(label="classify")
 
-        # Job 5: Generate report
+        # Job 5: Evaluate accuracy
+        evaluate_job = Job("evaluate_accuracy", _id="evaluate", node_label="evaluate")
+        evaluate_job.add_args(
+            "--predictions", predictions_file,
+            "--catalog", catalog_file,
+            "--output", accuracy_results,
+        )
+        evaluate_job.add_inputs(predictions_file, catalog_file)
+        evaluate_job.add_outputs(accuracy_results, stage_out=True, register_replica=False)
+        evaluate_job.add_pegasus_profile(label="evaluate")
+
+        # Job 6: Generate report
         report_job = Job("generate_report", _id="report", node_label="report")
         report_job.add_args(
             "--predictions", predictions_file,
             "--output-dir", ".",
             "--format", "all",
+            "--accuracy", accuracy_results,
         )
-        report_job.add_inputs(predictions_file)
+        report_job.add_inputs(predictions_file, accuracy_results)
         report_job.add_outputs(report_html, stage_out=True, register_replica=False)
         report_job.add_outputs(report_summary, stage_out=True, register_replica=False)
         report_job.add_outputs(disease_distribution_png, stage_out=True, register_replica=False)
@@ -265,13 +288,14 @@ class CropHealthWorkflow:
         report_job.add_pegasus_profile(label="report")
 
         # Add jobs to workflow
-        self.wf.add_jobs(fetch_job, preprocess_job, train_job, classify_job, report_job)
+        self.wf.add_jobs(fetch_job, preprocess_job, train_job, classify_job, evaluate_job, report_job)
 
         # Define dependencies
         self.wf.add_dependency(fetch_job, children=[preprocess_job])
         self.wf.add_dependency(preprocess_job, children=[train_job])
         self.wf.add_dependency(train_job, children=[classify_job])
-        self.wf.add_dependency(classify_job, children=[report_job])
+        self.wf.add_dependency(classify_job, children=[evaluate_job])
+        self.wf.add_dependency(evaluate_job, children=[report_job])
 
 
 def main():

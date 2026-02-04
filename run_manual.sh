@@ -10,6 +10,7 @@ CATALOG="crop_catalog.csv"
 PROCESSED_DIR="./processed"
 MODEL_DIR="./models"
 PREDICTIONS="predictions.json"
+ACCURACY="accuracy_results.json"
 REPORT_DIR="./report"
 
 echo "=== Step 1: Download and catalog images from Kaggle ==="
@@ -39,10 +40,17 @@ echo "=== Step 4: Classify images ==="
     --input "${IMAGE_DIR}" \
     --output "${PREDICTIONS}"
 
-echo "=== Step 5: Generate report ==="
+echo "=== Step 5: Evaluate accuracy ==="
+./bin/evaluate_accuracy.py \
+    --predictions "${PREDICTIONS}" \
+    --catalog "${CATALOG}" \
+    --output "${ACCURACY}"
+
+echo "=== Step 6: Generate report ==="
 ./bin/generate_report.py \
     --predictions "${PREDICTIONS}" \
     --output-dir "${REPORT_DIR}" \
-    --format all
+    --format all \
+    --accuracy "${ACCURACY}"
 
 echo "=== Complete! Report at ${REPORT_DIR}/report.html ==="

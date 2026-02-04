@@ -219,7 +219,53 @@ def create_confidence_histogram(predictions: List[Dict], output_path: Path):
     logger.info(f"Saved confidence histogram")
 
 
-def generate_html_report(data: Dict, output_path: Path):
+def create_confusion_matrix_chart(accuracy_data: Dict, output_path: Path):
+    """Create confusion matrix heatmap chart."""
+    cm_data = accuracy_data.get('confusion_matrix', {})
+    labels = cm_data.get('labels', [])
+    matrix = cm_data.get('matrix', [])
+
+    if not labels or not matrix:
+        logger.warning("No confusion matrix data to plot")
+        return
+
+    matrix_np = np.array(matrix, dtype=float)
+
+    fig, ax = plt.subplots(figsize=(max(8, len(labels)), max(6, len(labels) * 0.8)))
+
+    im = ax.imshow(matrix_np, interpolation='nearest', cmap='Blues')
+    fig.colorbar(im, ax=ax)
+
+    ax.set_xticks(np.arange(len(labels)))
+    ax.set_yticks(np.arange(len(labels)))
+
+    # Shorten labels for display
+    short_labels = [l.replace('__', '\n') if len(l) > 20 else l for l in labels]
+    ax.set_xticklabels(short_labels, rotation=45, ha='right', fontsize=8)
+    ax.set_yticklabels(short_labels, fontsize=8)
+
+    # Add text annotations
+    thresh = matrix_np.max() / 2.0
+    for i in range(len(labels)):
+        for j in range(len(labels)):
+            val = int(matrix_np[i, j])
+            if val > 0:
+                ax.text(j, i, str(val), ha='center', va='center',
+                        color='white' if matrix_np[i, j] > thresh else 'black',
+                        fontsize=7)
+
+    ax.set_xlabel('Predicted Class', fontsize=12)
+    ax.set_ylabel('True Class', fontsize=12)
+    ax.set_title('Confusion Matrix', fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+    plt.savefig(output_path / 'confusion_matrix.png', dpi=150)
+    plt.close()
+
+    logger.info("Saved confusion matrix chart")
+
+
+def generate_html_report(data: Dict, output_path: Path, accuracy_data: Dict = None):
     """Generate HTML report."""
     predictions = data.get('predictions', [])
     summary = data.get('summary', {})
@@ -291,15 +337,72 @@ def generate_html_report(data: Dict, output_path: Path):
         html += "        </table>\n"
 
     # Charts
+    chart_images = [
+        ("disease_distribution.png", "Disease Distribution"),
+        ("severity_distribution.png", "Severity Levels"),
+        ("crop_health_summary.png", "Crop Health"),
+        ("confidence_histogram.png", "Confidence Scores"),
+    ]
+    if accuracy_data:
+        chart_images.append(("confusion_matrix.png", "Confusion Matrix"))
+
     html += """
         <h2>Visualizations</h2>
         <div class="chart-container">
-            <div class="chart"><img src="disease_distribution.png" width="400"><p>Disease Distribution</p></div>
-            <div class="chart"><img src="severity_distribution.png" width="400"><p>Severity Levels</p></div>
-            <div class="chart"><img src="crop_health_summary.png" width="400"><p>Crop Health</p></div>
-            <div class="chart"><img src="confidence_histogram.png" width="400"><p>Confidence Scores</p></div>
-        </div>
 """
+    for img_file, caption in chart_images:
+        html += f'            <div class="chart"><img src="{img_file}" width="400"><p>{caption}</p></div>\n'
+    html += """        </div>
+"""
+
+    # Accuracy metrics section
+    if accuracy_data:
+        overall_acc = accuracy_data.get('overall_accuracy', 0)
+        total_eval = accuracy_data.get('total_evaluated', 0)
+        correct_count = accuracy_data.get('correct', 0)
+        incorrect_count = accuracy_data.get('incorrect', 0)
+        unmatched_count = accuracy_data.get('unmatched', 0)
+        per_class = accuracy_data.get('per_class', {})
+
+        html += f"""
+        <h2>Accuracy Metrics</h2>
+        <div class="summary-box">
+            <p><strong>Overall Accuracy:</strong> {overall_acc:.2%}</p>
+            <p><strong>Total Evaluated:</strong> {total_eval}</p>
+            <p><strong>Correct:</strong> <span class="healthy">{correct_count}</span></p>
+            <p><strong>Incorrect:</strong> <span class="diseased">{incorrect_count}</span></p>
+"""
+        if unmatched_count > 0:
+            html += f"            <p><strong>Unmatched:</strong> {unmatched_count}</p>\n"
+        html += "        </div>\n"
+
+        if per_class:
+            html += """
+        <h3>Per-Class Metrics</h3>
+        <table>
+            <tr>
+                <th>Class</th>
+                <th>Total</th>
+                <th>Correct</th>
+                <th>Accuracy</th>
+                <th>Precision</th>
+                <th>Recall</th>
+                <th>F1</th>
+            </tr>
+"""
+            for cls_name in sorted(per_class.keys()):
+                metrics = per_class[cls_name]
+                html += f"""            <tr>
+                <td>{cls_name}</td>
+                <td>{metrics['total']}</td>
+                <td>{metrics['correct']}</td>
+                <td>{metrics['accuracy']:.2%}</td>
+                <td>{metrics['precision']:.2%}</td>
+                <td>{metrics['recall']:.2%}</td>
+                <td>{metrics['f1']:.2%}</td>
+            </tr>
+"""
+            html += "        </table>\n"
 
     # Treatment recommendations
     unique_treatments = {}
@@ -379,7 +482,8 @@ def generate_html_report(data: Dict, output_path: Path):
     logger.info(f"Saved HTML report")
 
 
-def generate_report(predictions_file: str, output_dir: str, format: str = 'all'):
+def generate_report(predictions_file: str, output_dir: str, format: str = 'all',
+                    accuracy_file: str = None):
     """Generate complete report."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -394,26 +498,46 @@ def generate_report(predictions_file: str, output_dir: str, format: str = 'all')
 
     logger.info(f"Generating report for {len(predictions)} predictions")
 
+    # Load accuracy data if provided
+    accuracy_data = None
+    if accuracy_file:
+        try:
+            with open(accuracy_file, 'r') as f:
+                accuracy_data = json.load(f)
+            logger.info(f"Loaded accuracy data: {accuracy_data.get('overall_accuracy', 0):.2%} overall accuracy")
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            logger.warning(f"Could not load accuracy file: {e}")
+
     # Generate visualizations
     if format in ['all', 'charts']:
         create_disease_distribution_chart(predictions, output_path)
         create_severity_chart(predictions, output_path)
         create_crop_health_summary(predictions, output_path)
         create_confidence_histogram(predictions, output_path)
+        if accuracy_data:
+            create_confusion_matrix_chart(accuracy_data, output_path)
 
     # Generate HTML report
     if format in ['all', 'html']:
-        generate_html_report(data, output_path)
+        generate_html_report(data, output_path, accuracy_data=accuracy_data)
 
     # Generate JSON summary
     if format in ['all', 'json']:
+        summary_data = {
+            'generated_at': datetime.now().isoformat(),
+            'summary': data.get('summary', {}),
+            'critical_alerts': data.get('critical_alerts', []),
+        }
+        if accuracy_data:
+            summary_data['accuracy'] = {
+                'overall_accuracy': accuracy_data.get('overall_accuracy'),
+                'total_evaluated': accuracy_data.get('total_evaluated'),
+                'correct': accuracy_data.get('correct'),
+                'incorrect': accuracy_data.get('incorrect'),
+            }
         summary_file = output_path / 'report_summary.json'
         with open(summary_file, 'w') as f:
-            json.dump({
-                'generated_at': datetime.now().isoformat(),
-                'summary': data.get('summary', {}),
-                'critical_alerts': data.get('critical_alerts', []),
-            }, f, indent=2)
+            json.dump(summary_data, f, indent=2)
         logger.info(f"Saved JSON summary")
 
     logger.info(f"Report generated in {output_dir}")
@@ -446,9 +570,17 @@ def main():
         help='Output format'
     )
 
+    parser.add_argument(
+        '--accuracy', '-a',
+        type=str,
+        default=None,
+        help='Optional accuracy results JSON file'
+    )
+
     args = parser.parse_args()
 
-    generate_report(args.predictions, args.output_dir, args.format)
+    generate_report(args.predictions, args.output_dir, args.format,
+                    accuracy_file=args.accuracy)
 
 
 if __name__ == "__main__":
