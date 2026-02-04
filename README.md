@@ -59,41 +59,33 @@ The notebook walks through the complete workflow: configuring parameters, genera
 
 ## Running on FABRIC
 
-The workflow can also be run on the [FABRIC testbed](https://fabric-testbed.net/) by first deploying a distributed Pegasus/HTCondor cluster across FABRIC sites.
+The workflow can also be run on the [FABRIC testbed](https://fabric-testbed.net/) by deploying a distributed Pegasus/HTCondor cluster across FABRIC sites.
 
-### Step 1: Deploy a Pegasus/HTCondor Cluster
+### Deploy a Pegasus/HTCondor Cluster
 
-#### Option 1: FABRIC Artifact (Recommended)
+You can provision a cluster using either of the following notebooks:
 
-Download and run the pre-configured Pegasus-FABRIC notebook from the FABRIC Artifacts repository:
+| Option | Link | Description |
+|--------|------|-------------|
+| FABRIC Artifact (Recommended) | [Pegasus-FABRIC Artifact](https://artifacts.fabric-testbed.net/artifacts/53da4088-a175-4f0c-9e25-a4a371032a39) | Pre-configured notebook from the FABRIC Artifacts repository |
+| Jupyter Examples | [pegasus-fabric.ipynb](https://github.com/fabric-testbed/jupyter-examples/blob/f7be0c75f22544c72d7b3e3fa42bbdfd9d8bb841/fabric_examples/complex_recipes/pegasus/pegasus-fabric.ipynb) | Notebook from the official FABRIC Jupyter examples |
 
-**Artifact URL**: https://artifacts.fabric-testbed.net/artifacts/53da4088-a175-4f0c-9e25-a4a371032a39
+Both notebooks provision the following cluster architecture:
 
-This artifact contains a complete setup for deploying a distributed Pegasus/HTCondor infrastructure across FABRIC sites.
+- **Submit Node** -- Central Manager running HTCondor scheduler and Pegasus WMS
+- **Worker Nodes** -- Distributed execution points across multiple FABRIC sites
+- **FABNetv4 Networking** -- Private L3 network connecting all nodes
 
-#### Option 2: Jupyter Examples Repository
-
-Use the Pegasus-FABRIC notebook from the official FABRIC Jupyter examples:
-
-**GitHub**: https://github.com/fabric-testbed/jupyter-examples/blob/f7be0c75f22544c72d7b3e3fa42bbdfd9d8bb841/fabric_examples/complex_recipes/pegasus/pegasus-fabric.ipynb
-
-#### Cluster Architecture
-
-The notebook provisions:
-- **Submit Node**: Central Manager running HTCondor scheduler and Pegasus WMS
-- **Worker Nodes**: Distributed execution points across multiple FABRIC sites
-- **FABNetv4 Networking**: Private L3 network connecting all nodes
-
-#### Setup Steps
+### Setup Steps
 
 1. Log into the [FABRIC JupyterHub](https://jupyter.fabric-testbed.net/)
-2. Upload/clone the Pegasus-FABRIC notebook
+2. Upload or clone one of the Pegasus-FABRIC notebooks above
 3. Configure your desired sites and node specifications
 4. Run the notebook to provision the cluster
 5. Clone this repository on the submit node
-6. Run the workflow using the CLI or the Access notebook
+6. Run the workflow using the CLI (below) or the [Access notebook](Access-CropHealth-workflow.ipynb)
 
-### Step 2: Run the Workflow
+### Run the Workflow
 
 SSH to the submit node and run:
 
@@ -110,6 +102,9 @@ cd crophealth-workflow
 
 # Submit to HTCondor
 pegasus-plan --submit -s condorpool -o local workflow.yml
+
+# Monitor
+pegasus-status <run_directory>
 ```
 
 ## Prerequisites
