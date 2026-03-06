@@ -1,0 +1,142 @@
+# -------------------------------------------------------------------------
+#
+# Kiso experiment configuration for the Crop Health workflow on FABRIC testbed.
+#
+# Prerequisites:
+#   pip install kiso[fabric]
+#   export FABRIC_BASTION_USERNAME=<your_fabric_username>
+#
+# Usage:
+#   kiso check experiment.yml          # Validate configuration
+#   kiso up experiment.yml             # Provision FABRIC resources
+#   kiso run experiment.yml            # Run the workflow
+#   kiso down experiment.yml           # Destroy resources
+#
+# See: https://kiso.readthedocs.io
+# -------------------------------------------------------------------------
+
+name: crophealth-experiment
+
+# ---------------------------------------------------------------------------
+# Deployment: HTCondor cluster layout
+# ---------------------------------------------------------------------------
+deployment:
+  htcondor:
+    - kind: central-manager
+      labels:
+        - central-manager-daemon
+    - kind: submit
+      labels:
+        - submit-daemon
+    - kind: execute
+      labels:
+        - execute-daemon
+
+# ---------------------------------------------------------------------------
+# Software: Install Apptainer on execute nodes for Singularity containers
+# The workflow uses docker://kthare10/crophealth:latest via Singularity.
+# ---------------------------------------------------------------------------
+software:
+  apptainer:
+    labels:
+      - execute-daemon
+
+# ---------------------------------------------------------------------------
+# Sites: FABRIC testbed resources
+# ---------------------------------------------------------------------------
+sites:
+  - kind: fabric
+    # Path to your FABRIC token/credentials file.
+    # Generate at: https://portal.fabric-testbed.net -> Experiments -> Manage SSH Keys
+    rc_file: secrets/fabric_rc
+
+    # Slice lifetime (HH:MM)
+    walltime: "08:00:00"
+
+    # Default site for machines/networks not specifying their own site.
+    site: UCSD
+
+    # Prefix for FABRIC slice/node names
+    name_prefix: crophealth-experiment
+
+    # Base OS image
+    image: default_rocky_8
+
+    resources:
+      machines:
+        # Combined central-manager + submit node
+        # small: 4 cores, 16 GB RAM — sufficient for Pegasus planning/submission
+        - labels:
+            - central-manager-daemon
+            - submit-daemon
+          flavour_desc:
+            core: 4
+            mem: 16
+            disk: 30
+          number: 1
+
+        # Execute nodes — need 32 GB RAM for training/preprocessing/classify jobs
+        # medium: 8 cores, 32 GB RAM
+        - labels:
+            - execute-daemon
+          flavour_desc:
+            core: 8
+            mem: 34
+            disk: 30
+          number: 2
+
+      networks:
+        # FABNetv4: FABRIC-routed IPv4 network (enables inter-node communication
+        # and outbound internet access for Kaggle downloads and Docker Hub pulls)
+        - labels:
+            - condorpool-network
+          name: crophealth-fabnet
+          kind: FABNetv4
+          site: UCSD
+          nic:
+            kind: SharedNIC
+            model: ConnectX-6
+
+# ---------------------------------------------------------------------------
+# Experiment: Run the Pegasus crop health workflow
+# ---------------------------------------------------------------------------
+experiments:
+  - kind: pegasus
+    name: crophealth-experiment
+    count: 1
+
+    # Workflow generator script — runs on the submit node to produce workflow.yml
+    # then Kiso invokes pegasus-plan to submit it.
+    main: |
+      #!/bin/bash
+      set -e
+      source $(dirname $(realpath ./workflow_generator.py))/secrets/kaggle.sh
+      ./workflow_generator.py --data-source kaggle --kaggle-dataset emmarex/plantdisease --image-size 128 --epochs 10 --output workflow.yml
+      pegasus-plan -s condorpool -o local workflow.yml
+
+    # Workflow is submitted from the submit node
+    submit_node_labels:
+      - submit-daemon
+
+    # Timeout (seconds) before considering the workflow failed — CNN training
+    # on the PlantVillage dataset can take several hours.
+    timeout: 14400   # 4 hours
+    poll_interval: 60
+
+    # Setup: make all scripts executable on the submit node
+    setup:
+      - labels:
+          - submit-daemon
+        script: |
+          chmod +x main.sh
+          chmod +x workflow_generator.py fetch_crop_images.py
+          chmod +x bin/preprocess_images.py bin/train_classifier.py
+          chmod +x bin/classify_disease.py bin/evaluate_accuracy.py
+          chmod +x bin/generate_report.py
+
+    # Retrieve outputs back to the local machine after the workflow completes
+    outputs:
+      - labels:
+          - submit-daemon
+        src: ~kiso/crophealth-workflow/output/
+        dst: ./output/
