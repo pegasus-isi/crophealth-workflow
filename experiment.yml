@@ -60,7 +60,7 @@ sites:
     name_prefix: crophealth-experiment
 
     # Base OS image
-    image: default_rocky_8
+    image: default_rocky_9
 
     resources:
       machines:
