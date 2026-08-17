@@ -18,11 +18,13 @@
 #    export KAGGLE_KEY="your-api-key"
 #    # Accept dataset terms: https://www.kaggle.com/datasets/emmarex/plantdisease
 #
-# 3. Build Docker container (multi-platform for DPU support):
-#    cd Docker
-#    docker buildx build --platform linux/amd64,linux/arm64 \
-#        -f CropHealth_Dockerfile \
-#        -t kthare10/crophealth:latest --push .
+# 3. Build the Apptainer container (from the workflow root, no registry push):
+#    apptainer build Apptainer/CropHealth_Container.sif \
+#        Apptainer/CropHealth_Container.def
+#
+#    A .sif has no multi-arch manifest (one file, one architecture), so DPU/edge
+#    runs need a second .sif built on an aarch64 host, passed via
+#    --container-sif. Apptainer cannot build on macOS; see APPTAINER.md.
 
 # ==============================================================================
 # Step 1: Organize Local Images
