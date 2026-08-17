@@ -93,6 +93,10 @@ SSH to the submit node and run:
 ```bash
 cd crophealth-workflow
 
+# Build the container first (see Quick Start step 1 for details)
+apptainer build Apptainer/CropHealth_Container.sif \
+    Apptainer/CropHealth_Container.def
+
 # Generate workflow
 ./workflow_generator.py \
     --data-source kaggle \
@@ -115,7 +119,7 @@ pegasus-status <run_directory>
 - Python 3.9+
 - Pegasus WMS v5.0+
 - HTCondor v10.2+
-- Docker or Singularity
+- Apptainer (on the submit host to build, and on the worker nodes to run)
 
 ### Python Dependencies
 
@@ -180,8 +184,10 @@ crophealth-workflow/
 │   ├── classify_disease.py        # Disease inference
 │   ├── evaluate_accuracy.py       # Accuracy evaluation against ground truth
 │   └── generate_report.py         # Report generation
+├── Apptainer/
+│   └── CropHealth_Container.def   # Container definition (built to a .sif)
 ├── Docker/
-│   └── CropHealth_Dockerfile      # Multi-platform container
+│   └── CropHealth_Dockerfile      # Legacy Dockerfile, kept as a fallback
 ├── models/                        # Trained models
 ├── output/                        # Workflow outputs
 └── README.md
@@ -189,7 +195,57 @@ crophealth-workflow/
 
 ## Quick Start
 
-### 1. Prepare Your Images
+### 1. Build the Container
+
+Do this first — the generator in step 4 expects the `.sif` to exist.
+
+```bash
+# Run from the workflow root. No registry push needed: Pegasus stages the .sif
+# like any other input file.
+apptainer build Apptainer/CropHealth_Container.sif \
+    Apptainer/CropHealth_Container.def
+
+# Verify
+apptainer exec Apptainer/CropHealth_Container.sif \
+    python -c "import torch, kagglehub, sklearn; print('ok')"
+apptainer exec Apptainer/CropHealth_Container.sif which curl wget
+```
+
+`workflow_generator.py` looks for `Apptainer/CropHealth_Container.sif` by default
+(override with `--container-sif`).
+
+Apptainer cannot build on macOS, and a `.sif` is single-architecture — build on a
+Linux host matching your worker nodes. A DPU/edge run needs a second `.sif` built on
+an aarch64 host. See [`APPTAINER.md`](APPTAINER.md). The legacy
+`Docker/CropHealth_Dockerfile` is kept as a fallback.
+
+<details>
+<summary>Optional: publish the image to ghcr.io</summary>
+
+Useful for sharing one build across a team or citing an immutable artifact. Needs a
+GitHub token with `write:packages`.
+
+```bash
+echo "$GHCR_TOKEN" | apptainer registry login --username <github-user> \
+    --password-stdin oras://ghcr.io
+
+TAG=$(git rev-parse --short HEAD)
+apptainer push Apptainer/CropHealth_Container.sif \
+    oras://ghcr.io/pegasus-isi/crophealth-workflow:$TAG
+
+# On the submit host, pull back to the path the generator expects
+apptainer pull Apptainer/CropHealth_Container.sif \
+    oras://ghcr.io/pegasus-isi/crophealth-workflow:$TAG
+```
+
+Do **not** put the `oras://` URL in the transformation catalog — Pegasus supports
+`docker://`, `shub://`, `library://`, `shifter://` and `file://`, not `oras://`.
+Treat ghcr.io as a distribution channel and keep staging the local `.sif`. Details in
+[`APPTAINER.md`](APPTAINER.md).
+
+</details>
+
+### 2. Prepare Your Images
 
 Organize images in disease categories:
 
@@ -204,7 +260,7 @@ field_images/
 │   └── image4.jpg
 ```
 
-### 2. Create Image Catalog
+### 3. Create Image Catalog
 
 ```bash
 cd crophealth-workflow
@@ -221,7 +277,7 @@ cd crophealth-workflow
     --output crop_catalog.csv
 ```
 
-### 3. Generate Workflow
+### 4. Generate Workflow
 
 #### Standard Mode
 ##### Using pre downloaded local data
@@ -257,7 +313,7 @@ cd crophealth-workflow
     --output workflow.yml
 ```
 
-### 4. Submit to HTCondor
+### 5. Submit to HTCondor
 
 ```bash
 # Standard mode
@@ -270,7 +326,7 @@ pegasus-plan --submit -s edgepool -s cloudpool -o local workflow.yml
 pegasus-status <run_directory>
 ```
 
-### 5. View Results
+### 6. View Results
 
 ```
 output/
@@ -452,23 +508,10 @@ For GPU-accelerated training:
 
 ### Custom Container
 
-```bash
-# Run from the workflow root. No registry push needed — Pegasus stages the
-# .sif like any other input file.
-apptainer build Apptainer/CropHealth_Container.sif \
-    Apptainer/CropHealth_Container.def
-
-# Verify
-apptainer exec Apptainer/CropHealth_Container.sif \
-    python -c "import torch, kagglehub, sklearn; print('ok')"
-```
-
-`workflow_generator.py` looks for `Apptainer/CropHealth_Container.sif` by default
-(override with `--container-sif`).
-
-Apptainer cannot build on macOS, and a `.sif` is single-architecture — build on a
-Linux host matching your worker nodes. See `../APPTAINER.md`. The legacy
-`Docker/CropHealth_Dockerfile` is kept as a fallback.
+See [Quick Start step 1](#1-build-the-container) for the build command, and
+[`APPTAINER.md`](APPTAINER.md) for the definition-file reference and the
+ghcr.io publishing recipe. Point the generator at a different image with
+`--container-sif /path/to/your.sif`.
 
 ### Using Pre-trained Model
 
