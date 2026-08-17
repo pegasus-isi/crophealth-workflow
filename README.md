@@ -450,16 +450,25 @@ For GPU-accelerated training:
     --device cuda
 ```
 
-### Custom Docker Container
+### Custom Container
 
 ```bash
-cd Docker
+# Run from the workflow root. No registry push needed — Pegasus stages the
+# .sif like any other input file.
+apptainer build Apptainer/CropHealth_Container.sif \
+    Apptainer/CropHealth_Container.def
 
-# Build for both x86_64 and ARM64
-docker buildx build --platform linux/amd64 \
-    -f CropHealth_Dockerfile \
-    -t kthare10/crophealth:latest --push .
+# Verify
+apptainer exec Apptainer/CropHealth_Container.sif \
+    python -c "import torch, kagglehub, sklearn; print('ok')"
 ```
+
+`workflow_generator.py` looks for `Apptainer/CropHealth_Container.sif` by default
+(override with `--container-sif`).
+
+Apptainer cannot build on macOS, and a `.sif` is single-architecture — build on a
+Linux host matching your worker nodes. See `../APPTAINER.md`. The legacy
+`Docker/CropHealth_Dockerfile` is kept as a fallback.
 
 ### Using Pre-trained Model
 
