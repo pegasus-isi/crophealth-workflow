@@ -8,7 +8,7 @@
 #   apptainer build Apptainer/CropHealth_Container.sif Apptainer/CropHealth_Container.def
 
 Bootstrap: docker
-From: python:3.8.12-slim
+From: python:3.10.21-slim
 
 %post
     # Install system dependencies.
