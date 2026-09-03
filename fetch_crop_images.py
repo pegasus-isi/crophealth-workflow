@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import csv
+import hashlib
 import json
 import logging
 import os
@@ -31,7 +32,9 @@ import tarfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlparse
+
 import kagglehub
+from PIL import Image
 
 logging.basicConfig(
     level=logging.INFO,
@@ -223,11 +226,36 @@ def download_kaggle_dataset(dataset: str, output_dir: str) -> List[Dict]:
     return scan_local_images(str(dataset_path), output_dir, recursive=True)
 
 
+def _write_placeholder_image(path: Path, category: str, index: int, size: int = 64) -> None:
+    """Write one synthetic JPEG for `category`.
+
+    Sample mode used to write catalog *rows* naming .jpg files it never
+    created, so the pipeline could not run on it: classify_disease found 0
+    images, wrote empty predictions, and the run died downstream. The catalog
+    has to describe files that exist.
+
+    One flat colour per category (derived from the category name, so runs are
+    reproducible) plus a per-image dither. That makes the set trivially
+    separable, which is the point — sample mode is here to prove the workflow
+    runs, not to pose a vision problem. md5 rather than hash() because
+    hash() is salted per process and the colours would change between runs.
+    """
+    digest = hashlib.md5(category.encode()).digest()
+    base = (digest[0], digest[1], digest[2])
+    accent = tuple((c + 40) % 256 for c in base)
+    image = Image.new("RGB", (size, size), base)
+    pixels = image.load()
+    for x in range(size):
+        for y in range(size):
+            if (x + y + index) % 7 == 0:
+                pixels[x, y] = accent
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image.save(path, format="JPEG", quality=85)
+
+
 def create_sample_catalog(output_dir: str) -> List[Dict]:
     """
-    Create sample catalog with placeholder entries for testing.
-
-    In production, this would download sample images from a public URL.
+    Create a runnable sample dataset: catalog entries *and* their images.
     """
     records = []
     output_path = Path(output_dir)
@@ -251,9 +279,9 @@ def create_sample_catalog(output_dir: str) -> List[Dict]:
             'treatment': 'Consult expert',
         })
 
-        # Create placeholder entries (would be actual images in production)
         for j in range(3):
             filename = f"{category}_sample_{j+1}.jpg"
+            _write_placeholder_image(output_path / filename, category, j)
             records.append({
                 'image_path': str(output_path / filename),
                 'filename': filename,
@@ -265,21 +293,46 @@ def create_sample_catalog(output_dir: str) -> List[Dict]:
                 'is_sample': True,  # Mark as sample data
             })
 
-    logger.info(f"Created {len(records)} sample catalog entries")
-    logger.warning("Sample mode: No actual images downloaded. Use --source local or kaggle for real data.")
+    logger.info(
+        f"Created {len(records)} sample catalog entries and generated their "
+        f"placeholder images in {output_path}"
+    )
+    logger.warning(
+        "Sample mode: these are SYNTHETIC images (one flat colour per "
+        "category), not photographs of crops. They exercise the pipeline "
+        "end-to-end; any accuracy they produce says nothing about real crop "
+        "health. Use --source local or --source kaggle for real data."
+    )
     return records
 
 
+_CATALOG_FIELDS = [
+    'image_path', 'filename', 'category', 'crop', 'disease', 'treatment',
+    'is_healthy',
+]
+
+
 def save_catalog(records: List[Dict], output_file: str):
-    """Save image catalog to CSV."""
+    """Save image catalog to CSV.
+
+    An empty catalog still writes the file, header and all. Pegasus declares
+    this CSV as the job's output and HTCondor transfers it when the job exits,
+    so returning without writing it does not fail the workflow — it holds the
+    job on a stage-out error and hangs the DAG. The caller fails the step after
+    this returns.
+    """
     if not records:
-        logger.warning("No records to save")
+        logger.warning("No records to save — writing an empty catalog")
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w', newline='') as f:
+            csv.DictWriter(f, fieldnames=_CATALOG_FIELDS).writeheader()
         return
 
     output_path = Path(output_file)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    fieldnames = ['image_path', 'filename', 'category', 'crop', 'disease', 'treatment', 'is_healthy']
+    fieldnames = list(_CATALOG_FIELDS)
     if records[0].get('is_sample'):
         fieldnames.append('is_sample')
 
@@ -371,10 +424,33 @@ def main():
 
     if args.archive_output:
         output_path = Path(args.output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
         archive_path = Path(args.archive_output)
         with tarfile.open(archive_path, "w:gz") as tar:
             tar.add(output_path, arcname=output_path.name)
         logger.info(f"Archived images to {archive_path}")
+
+    # Both declared outputs now exist, so it is safe to fail. Stopping here
+    # keeps the cause where it is legible: an empty catalog means the source
+    # produced nothing, and every step after this one would otherwise report
+    # success on no data until the run hung somewhere further downstream.
+    if not records:
+        logger.error(
+            f"No images catalogued from --source {args.source}. "
+            "Nothing downstream can run; failing this step."
+        )
+        sys.exit(1)
+
+    images = sum(1 for _ in Path(args.output_dir).rglob('*')
+                 if _.suffix.lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.gif'})
+    if images == 0:
+        logger.error(
+            f"Catalogued {len(records)} record(s) but {args.output_dir} holds "
+            "no image files, so classification would have nothing to read. "
+            "Failing this step."
+        )
+        sys.exit(1)
+    logger.info(f"{images} image file(s) available in {args.output_dir}")
 
 
 if __name__ == "__main__":

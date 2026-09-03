@@ -17,6 +17,7 @@ import argparse
 import csv
 import json
 import logging
+import sys
 from collections import defaultdict
 from datetime import datetime
 
@@ -54,11 +55,11 @@ def compute_accuracy(predictions_file: str, catalog_file: str) -> dict:
 
     if not predictions:
         logger.warning("No predictions found")
-        return {}
+        return {"error": f"{predictions_file} contains no predictions"}
 
     if not catalog:
         logger.warning("No catalog entries found")
-        return {}
+        return {"error": f"{catalog_file} contains no usable catalog entries"}
 
     # Collect all labels
     all_labels = set()
@@ -95,7 +96,12 @@ def compute_accuracy(predictions_file: str, catalog_file: str) -> dict:
 
     if total == 0:
         logger.warning("No matched predictions found")
-        return {}
+        return {
+            "error": (
+                f"none of the {len(predictions)} prediction(s) matched a catalog "
+                f"entry by filename ({unmatched} unmatched)"
+            )
+        }
 
     # Sort labels for consistent ordering
     labels = sorted(all_labels)
@@ -185,16 +191,41 @@ def main():
 
     results = compute_accuracy(args.predictions, args.catalog)
 
-    if results:
+    # Write the output file on every path, including failure, THEN exit
+    # non-zero if there is nothing to report.
+    #
+    # Pegasus declares this file as the job's output, so HTCondor transfers it
+    # when the job exits — whatever the exit code. Returning without writing it
+    # does not fail the workflow, it *hangs* it: the transfer fails with
+    #     reading from file .../accuracy_results.json: (errno 2) No such file
+    #     or directory
+    # the job goes on hold, and DAGMan waits for a held job forever. That is
+    # what happened on 2026-09-03: 20 of 28 jobs done, one held, the run stuck
+    # at 71% with no failure to look at. A job with nothing to say must still
+    # say it in the file it promised, and then fail.
+    if "error" in results:
         with open(args.output, 'w') as f:
-            json.dump(results, f, indent=2)
-        logger.info(f"Accuracy results saved to {args.output}")
-        logger.info(f"Overall accuracy: {results['overall_accuracy']:.2%} "
-                     f"({results['correct']}/{results['total_evaluated']})")
-        if results['unmatched'] > 0:
-            logger.warning(f"Unmatched predictions (not in catalog): {results['unmatched']}")
-    else:
-        logger.error("No accuracy results computed")
+            json.dump(
+                {
+                    "evaluated_at": datetime.now().isoformat(),
+                    "error": results["error"],
+                    "overall_accuracy": None,
+                    "total_evaluated": 0,
+                },
+                f,
+                indent=2,
+            )
+        logger.error(f"No accuracy results computed: {results['error']}")
+        logger.error(f"Wrote {args.output} with the reason; failing this step.")
+        sys.exit(1)
+
+    with open(args.output, 'w') as f:
+        json.dump(results, f, indent=2)
+    logger.info(f"Accuracy results saved to {args.output}")
+    logger.info(f"Overall accuracy: {results['overall_accuracy']:.2%} "
+                 f"({results['correct']}/{results['total_evaluated']})")
+    if results['unmatched'] > 0:
+        logger.warning(f"Unmatched predictions (not in catalog): {results['unmatched']}")
 
 
 if __name__ == "__main__":

@@ -231,8 +231,32 @@ class CropHealthWorkflow:
             fetch_job.add_args("--input-dir", args.image_dir)
         elif args.data_source == "kaggle":
             fetch_job.add_args("--dataset", args.kaggle_dataset)
-        fetch_job.add_env(KAGGLE_USERNAME=os.environ.get('KAGGLE_USERNAME', ''))
-        fetch_job.add_env(KAGGLE_KEY=os.environ.get('KAGGLE_KEY', ''))
+        # Credentials reach a job only through add_env: HTCondor runs jobs in a
+        # clean environment, so exporting KAGGLE_KEY in the submit shell never
+        # reaches the job or its container. Capture it here, at generation
+        # time.
+        #
+        # Not defaulted to "": an empty key is indistinguishable from a real
+        # one until the job is on a worker node, where the failure reads as a
+        # Kaggle API error rather than "you did not set a credential". Only the
+        # kaggle source needs them, so a missing key is fatal there and
+        # irrelevant otherwise.
+        if args.data_source == "kaggle":
+            missing = [
+                name for name in ("KAGGLE_USERNAME", "KAGGLE_KEY")
+                if not os.environ.get(name)
+            ]
+            if missing:
+                logger.error(
+                    "--data-source kaggle needs %s in the environment of "
+                    "whatever runs this generator. In PegasusAI Studio set "
+                    "them under Settings > Pegasus Options > Workflow secrets; "
+                    "from a shell, export them before generating.",
+                    " and ".join(missing),
+                )
+                sys.exit(1)
+            fetch_job.add_env(KAGGLE_USERNAME=os.environ["KAGGLE_USERNAME"])
+            fetch_job.add_env(KAGGLE_KEY=os.environ["KAGGLE_KEY"])
         fetch_job.add_outputs(catalog_file, stage_out=True, register_replica=False)
         fetch_job.add_outputs(images_archive, stage_out=False, register_replica=False)
         fetch_job.add_pegasus_profile(label="fetch")
