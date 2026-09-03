@@ -392,9 +392,49 @@ def run_inference(model_dir: str, input_path: str, output_file: str):
         ]
     else:
         logger.error(f"Input path does not exist: {input_path}")
-        return
+        image_paths = []
 
     logger.info(f"Found {len(image_paths)} images to classify")
+
+    # Nothing to classify is a failure, not an empty success.
+    #
+    # This step used to write predictions.json with an empty list and exit 0,
+    # which looks like a successful classification of nothing. Downstream,
+    # evaluate_accuracy then had no predictions and refused to write its own
+    # output, which put the job on hold and hung the DAG (see that script). The
+    # emptiness has to stop here, where the cause is still visible: an empty
+    # images archive from `--source sample`, or an input path that does not
+    # exist.
+    #
+    # The output file is still written first, because Pegasus declared it and
+    # HTCondor transfers it on exit whatever the exit code — a missing declared
+    # output holds the job instead of failing it.
+    if not image_paths:
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, 'w') as f:
+            json.dump(
+                {
+                    'metadata': {
+                        'generated_at': datetime.now().isoformat(),
+                        'model_dir': str(model_dir),
+                        'framework': framework,
+                        'total_images': 0,
+                    },
+                    'error': (
+                        f"no images found under {input_path} — nothing to "
+                        "classify. If this ran with --source sample, that mode "
+                        "produces catalog entries only; use --source local or "
+                        "--source kaggle for a real run."
+                    ),
+                    'predictions': [],
+                },
+                f,
+                indent=2,
+            )
+        logger.error(f"No images to classify under {input_path}")
+        logger.error(f"Wrote {output_file} with the reason; failing this step.")
+        sys.exit(1)
 
     # Classify images
     results = classify_images(model, image_paths, label_mapping, framework)
