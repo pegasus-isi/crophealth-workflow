@@ -81,10 +81,10 @@ TOOL_RUNTIME = {
 }
 
 # Pegasus worker package (kickstart etc.) used *inside* the container, which
-# is Debian 11 (python:3.10-slim) whatever the submit host runs. Pegasus 6.0
-# publishes no deb_11 package; rhel_8 is built against glibc 2.28 and runs on
-# Debian 11's 2.31 (it is also PegasusLite's own fallback). Change this with
-# the container's base image.
+# is Debian 13 (python:3.10.21-slim) whatever the submit host runs. rhel_8 is
+# built against glibc 2.28, so it runs on any newer glibc (trixie has 2.41),
+# and it is PegasusLite's own fallback. Change this with the container's base
+# image.
 WORKER_PACKAGE_PLATFORM = "x86_64_rhel_8"
 WORKER_PACKAGE_URL = ("https://download.pegasus.isi.edu/pegasus/{v}/"
                       "pegasus-worker-{v}-" + WORKER_PACKAGE_PLATFORM + ".tar.gz")
@@ -137,12 +137,12 @@ class CropHealthWorkflow:
         """
         self.props = Properties()
         self.props["pegasus.transfer.threads"] = "16"
-        # Jobs run inside a Debian 11 container, whatever the submit host is.
+        # Jobs run inside a Debian 13 container, whatever the submit host is.
         # Left alone, PegasusLite ships the submit host's worker package and,
         # on a mismatch, downloads another from inside the container — which
         # fails where the image has no curl/wget (an unprivileged --fakeroot
         # build on a cluster cannot apt-get them), and the submit host's
-        # kickstart may need a newer glibc than Debian 11 has. So stage the
+        # kickstart may need a newer glibc than the image has. So stage the
         # container-compatible package named in the transformation catalog
         # (create_transformation_catalog) and never download. strict=false
         # covers the host side, where that package is only used to transfer.
@@ -174,6 +174,7 @@ class CropHealthWorkflow:
         container_sif="Apptainer/CropHealth_Container.sif",
         gpu=False,
         bind_workflow_dir=False,
+        large_memory="32 GB",
     ):
         """Containers and transformations; nothing here names a site.
 
@@ -230,15 +231,18 @@ class CropHealthWorkflow:
             )
 
         fetch_crop_images = tool("fetch_crop_images", "fetch_crop_images.py", "4 GB")
-        preprocess_images = tool("preprocess_images", "bin/preprocess_images.py", "32 GB")
-        train_classifier = tool("train_classifier", "bin/train_classifier.py", "32 GB")
+        # preprocess and train hold the whole dataset in memory: about 22 GB
+        # peak for the 9k-image tutorial set at 224 px, ~7 GB at 128 px
+        preprocess_images = tool("preprocess_images", "bin/preprocess_images.py", large_memory)
+        train_classifier = tool("train_classifier", "bin/train_classifier.py", large_memory)
         # train_classifier.py uses CUDA whenever the job lands on a GPU
         if gpu:
             train_classifier.add_pegasus_profile(gpus="1")
-        classify_disease = tool("classify_disease", "bin/classify_disease.py", "32 GB")
+        # classify reads one image at a time; report reads only predictions
+        classify_disease = tool("classify_disease", "bin/classify_disease.py", "8 GB")
         evaluate_accuracy = tool("evaluate_accuracy", "bin/evaluate_accuracy.py", "4 GB")
         merge_predictions = tool("merge_predictions", "bin/merge_predictions.py", "2 GB")
-        generate_report = tool("generate_report", "bin/generate_report.py", "32 GB")
+        generate_report = tool("generate_report", "bin/generate_report.py", "4 GB")
 
         self.tc.add_containers(crophealth_container)
         if self.worker_package_url:
@@ -649,6 +653,15 @@ def build_parser():
              "hosts 10 (default: 10)"
     )
 
+    parser.add_argument(
+        "--large-memory",
+        type=str,
+        default="32 GB",
+        help="Memory for preprocess_images and train_classifier, which hold "
+             "the whole dataset in memory (default: 32 GB; '12 GB' fits the "
+             "tutorial dataset at --image-size 128 on a 16 GB slot)"
+    )
+
     # GPUs
     parser.add_argument(
         "--gpu",
@@ -843,6 +856,7 @@ def generate(args):
         container_sif=args.container_sif,
         gpu=args.gpu,
         bind_workflow_dir=bind_wf,
+        large_memory=args.large_memory,
     )
     workflow.create_workflow(args)
     workflow.write()

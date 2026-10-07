@@ -136,11 +136,12 @@ def train_pytorch_model(
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
     logger.info(f"Using device: {device}")
 
-    # Convert to PyTorch tensors (channels first: NCHW)
-    train_X_t = torch.FloatTensor(train_X).permute(0, 3, 1, 2)
-    train_y_t = torch.LongTensor(train_y)
-    val_X_t = torch.FloatTensor(val_X).permute(0, 3, 1, 2)
-    val_y_t = torch.LongTensor(val_y)
+    # Convert to PyTorch tensors (channels first: NCHW). from_numpy shares the
+    # arrays' memory; FloatTensor(...) would copy the whole dataset again.
+    train_X_t = torch.from_numpy(np.asarray(train_X, dtype=np.float32)).permute(0, 3, 1, 2)
+    train_y_t = torch.from_numpy(np.asarray(train_y, dtype=np.int64))
+    val_X_t = torch.from_numpy(np.asarray(val_X, dtype=np.float32)).permute(0, 3, 1, 2)
+    val_y_t = torch.from_numpy(np.asarray(val_y, dtype=np.int64))
 
     # Create data loaders
     train_dataset = TensorDataset(train_X_t, train_y_t)
@@ -287,7 +288,8 @@ def train_sklearn_model(
     return model, history
 
 
-def save_model(model, history: Dict, label_mapping: Dict, output_dir: str, use_pytorch: bool):
+def save_model(model, history: Dict, label_mapping: Dict, output_dir: str, use_pytorch: bool,
+               image_size: int = None):
     """Save trained model and training info."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -308,6 +310,9 @@ def save_model(model, history: Dict, label_mapping: Dict, output_dir: str, use_p
         'trained_at': datetime.now().isoformat(),
         'framework': 'pytorch' if (use_pytorch and TORCH_AVAILABLE) else 'sklearn',
         'num_classes': label_mapping['num_classes'],
+        # classify_disease.py resizes inference images to this; a mismatch
+        # costs a lot of accuracy without any error
+        'image_size': image_size,
         'label_mapping': label_mapping,
         'history': history,
         'final_train_acc': history['train_acc'][-1] if history['train_acc'] else 0,
@@ -404,7 +409,8 @@ def main():
         sys.exit(1)
 
     # Save model
-    save_model(model, history, label_mapping, args.output_dir, use_pytorch)
+    save_model(model, history, label_mapping, args.output_dir, use_pytorch,
+               image_size=int(train_X.shape[1]))
 
 
 if __name__ == "__main__":

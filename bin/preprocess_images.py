@@ -79,9 +79,10 @@ def normalize_image(img: np.ndarray) -> np.ndarray:
     # Convert to float32
     img = img.astype(np.float32) / 255.0
 
-    # ImageNet normalization
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
+    # ImageNet normalization. float32 constants: float64 ones would silently
+    # promote every image to float64 and double the dataset's memory.
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
     img = (img - mean) / std
 
@@ -151,6 +152,15 @@ def preprocess_dataset(
     # Create label mapping
     label_to_idx, idx_to_label = create_label_mapping(catalog['category'].tolist())
 
+    # One row per image. A catalog listing an image twice (the hosted tutorial
+    # catalog lists every image twice) would put copies of the same image in
+    # both train and validation, inflating validation accuracy.
+    duplicates = catalog.duplicated(subset='image_path')
+    if duplicates.any():
+        logger.warning(f"Dropping {int(duplicates.sum())} duplicate catalog rows "
+                       "(same image_path)")
+        catalog = catalog[~duplicates]
+
     # Shuffle and split
     catalog_shuffled = catalog.sample(frac=1, random_state=42).reset_index(drop=True)
     split_idx = int(len(catalog_shuffled) * train_split)
@@ -160,11 +170,16 @@ def preprocess_dataset(
 
     logger.info(f"Train set: {len(train_df)}, Validation set: {len(val_df)}")
 
-    # Process images
-    train_images = []
-    train_labels = []
-    val_images = []
-    val_labels = []
+    # Write images straight into preallocated float32 arrays (trimmed at the
+    # end for failed images). Collecting a list and calling np.array on it
+    # holds every image twice at the peak, which for the tutorial dataset at
+    # 128 px went past a 12 GB job limit.
+    copies = len(augment_image(np.zeros((1, 1, 3), dtype=np.float32))) if augment else 1
+    shape = (image_size, image_size, 3)
+    train_X = np.empty((len(train_df) * copies, *shape), dtype=np.float32)
+    train_y = np.empty(len(train_df) * copies, dtype=np.int64)
+    val_X = np.empty((len(val_df), *shape), dtype=np.float32)
+    val_y = np.empty(len(val_df), dtype=np.int64)
 
     stats = {
         'processed': 0,
@@ -195,15 +210,9 @@ def preprocess_dataset(
 
         label = label_to_idx[category]
 
-        if augment:
-            augmented = augment_image(img)
-            for aug_img in augmented:
-                train_images.append(aug_img)
-                train_labels.append(label)
-                stats['train_samples'] += 1
-        else:
-            train_images.append(img)
-            train_labels.append(label)
+        for aug_img in (augment_image(img) if augment else [img]):
+            train_X[stats['train_samples']] = aug_img
+            train_y[stats['train_samples']] = label
             stats['train_samples'] += 1
 
         stats['processed'] += 1
@@ -227,25 +236,16 @@ def preprocess_dataset(
             img = normalize_image(img)
 
         label = label_to_idx[category]
-        val_images.append(img)
-        val_labels.append(label)
+        val_X[stats['val_samples']] = img
+        val_y[stats['val_samples']] = label
         stats['val_samples'] += 1
         stats['processed'] += 1
 
-    # Convert to numpy arrays
-    if train_images:
-        train_X = np.array(train_images)
-        train_y = np.array(train_labels)
-    else:
-        train_X = np.array([])
-        train_y = np.array([])
-
-    if val_images:
-        val_X = np.array(val_images)
-        val_y = np.array(val_labels)
-    else:
-        val_X = np.array([])
-        val_y = np.array([])
+    # Drop the slots of images that failed (slicing is a view, not a copy)
+    train_X = train_X[:stats['train_samples']]
+    train_y = train_y[:stats['train_samples']]
+    val_X = val_X[:stats['val_samples']]
+    val_y = val_y[:stats['val_samples']]
 
     # Save preprocessed data
     np.savez_compressed(
