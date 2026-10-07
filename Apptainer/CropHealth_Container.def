@@ -17,12 +17,18 @@ From: python:3.10.21-slim
     # reports success -- producing an image in which no Pegasus job can start,
     # because PegasusLite fetches its worker package with curl before the job
     # script runs.
-    sed -i \
-        -e "s|http://deb.debian.org/debian|http://archive.debian.org/debian|g" \
-        -e "/security.debian.org/d" \
-        -e "/bullseye-updates/d" \
-        /etc/apt/sources.list
-    echo "Acquire::Check-Valid-Until \"false\";" > /etc/apt/apt.conf.d/99no-check-valid-until
+    #
+    # Only for a bullseye base: python:3.10.21-slim is Debian 13 (trixie),
+    # which is current, keeps its sources in deb822 form and has no
+    # /etc/apt/sources.list -- running the rewrite there fails the build.
+    if grep -q '^VERSION_CODENAME=bullseye' /etc/os-release; then
+        sed -i \
+            -e "s|http://deb.debian.org/debian|http://archive.debian.org/debian|g" \
+            -e "/security.debian.org/d" \
+            -e "/bullseye-updates/d" \
+            /etc/apt/sources.list
+        echo "Acquire::Check-Valid-Until \"false\";" > /etc/apt/apt.conf.d/99no-check-valid-until
+    fi
 
     # Install system dependencies.
     # curl + wget are mandatory: PegasusLite downloads its worker package
