@@ -497,8 +497,8 @@ def main():
     parser.add_argument(
         '--model-dir', '-m',
         type=str,
-        required=True,
-        help='Directory with trained model'
+        default='.',
+        help='Directory with trained model (default: current directory)'
     )
 
     parser.add_argument(

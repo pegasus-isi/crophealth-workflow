@@ -22,20 +22,28 @@ The following diagram shows the workflow DAG:
 
 ![Crop Health Workflow DAG](images/workflow.png)
 
-### Edge-to-Cloud Architecture (DPU Mode)
+### Workflow Modes
 
-With `--enable-dpu`, the workflow distributes processing across edge and cloud:
+`--mode` selects which part of the pipeline to generate. `train` and `inference`
+follow the ACCESS Pegasus tutorials
+([05-Tutorial-ML-Training](https://github.com/pegasus-isi/ACCESS-Pegasus-Examples/tree/main/05-Tutorial-ML-Training),
+[06-Tutorial-ML-Inference](https://github.com/pegasus-isi/ACCESS-Pegasus-Examples/tree/main/06-Tutorial-ML-Inference)):
+train a model once, then reuse it over and over on new images.
+
+| Mode | DAG |
+|------|-----|
+| `full` (default) | fetch → preprocess → train → classify → evaluate → report |
+| `train` | [fetch →] preprocess → train |
+| `inference` | classify (one job per image, in parallel) → merge → report |
 
 ```
-Edge (DPU):   Fetch Images → Preprocess    (I/O intensive)
-                    ↓
-Cloud (CPU/GPU):  Train → Classify → Evaluate → Report  (compute intensive)
+inference:   classify_00 ─┐
+             classify_01 ─┼─→ merge_predictions → generate_report
+             classify_NN ─┘
 ```
 
-**Benefits:**
-- 40% faster end-to-end processing
-- Reduced data transfer to cloud
-- Edge preprocessing near data sources
+Inference mode has no ground truth for the new images, so it skips
+`evaluate_accuracy` and the report has no confusion matrix.
 
 ## Features
 
@@ -48,7 +56,7 @@ Cloud (CPU/GPU):  Train → Classify → Evaluate → Report  (compute intensive
 - **Accuracy evaluation**: Per-class precision, recall, F1, and confusion matrix
 - **Rich visualizations**: Distribution charts, confidence histograms, confusion matrix heatmap
 - **HTML reports**: Professional reports with all findings including accuracy metrics
-- **Edge-to-Cloud**: Optional DPU-accelerated workflow for FABRIC deployments
+- **Train once, infer many times**: separate `train` and `inference` modes; inference fans out one job per image
 
 ## Running on ACCESS
 
@@ -175,7 +183,8 @@ Now you can use the Kaggle data source:
 
 ```
 crophealth-workflow/
-├── workflow_generator.py          # Unified workflow generator (standard + DPU)
+├── workflow_generator.py          # Workflow generator (full / train / inference modes)
+├── custom_sites.py                # Site catalog (sites.yml): HTCondor, Slurm, hosted
 ├── fetch_crop_images.py           # Image fetcher/catalog creator
 ├── example_usage.sh               # Example usage script
 ├── bin/
@@ -183,6 +192,7 @@ crophealth-workflow/
 │   ├── train_classifier.py        # CNN model training
 │   ├── classify_disease.py        # Disease inference
 │   ├── evaluate_accuracy.py       # Accuracy evaluation against ground truth
+│   ├── merge_predictions.py       # Merge per-image predictions (inference mode)
 │   └── generate_report.py         # Report generation
 ├── Apptainer/
 │   └── CropHealth_Container.def   # Container definition (built to a .sif)
@@ -215,8 +225,8 @@ apptainer exec Apptainer/CropHealth_Container.sif which curl wget
 (override with `--container-sif`).
 
 Apptainer cannot build on macOS, and a `.sif` is single-architecture — build on a
-Linux host matching your worker nodes. A DPU/edge run needs a second `.sif` built on
-an aarch64 host. See [`APPTAINER.md`](APPTAINER.md). The legacy
+Linux host matching your worker nodes (an aarch64 pool needs its own `.sif` built
+on an aarch64 host). See [`APPTAINER.md`](APPTAINER.md). The legacy
 `Docker/CropHealth_Dockerfile` is kept as a fallback.
 
 <details>
@@ -279,7 +289,7 @@ cd crophealth-workflow
 
 ### 4. Generate Workflow
 
-#### Standard Mode
+#### Full Mode
 ##### Using pre downloaded local data
 ```bash
 ./workflow_generator.py \
@@ -290,7 +300,7 @@ cd crophealth-workflow
     --batch-size 16 \
     --output workflow.yml
 ```
-##### Downloa data from Kaggle
+##### Download data from Kaggle
 ```bash
 ./workflow_generator.py  \
     --data-source kaggle  \
@@ -301,32 +311,139 @@ cd crophealth-workflow
     --output workflow.yml
 ```
 
-#### Edge-to-Cloud DPU Mode
+#### Train Mode
+
+Preprocess and train only. `--data-source remote` uses the catalog and image
+archive hosted at `--base-url` (the ACCESS tutorial dataset) instead of a fetch
+job; `--gpu` requests a GPU for the training job.
 
 ```bash
 ./workflow_generator.py \
-    --data-source local \
-    --image-dir ./field_images \
-    --enable-dpu \
-    --edge-site edgepool \
-    --cloud-site cloudpool \
+    --mode train \
+    --data-source remote \
+    --gpu \
     --output workflow.yml
 ```
 
-### 5. Submit to HTCondor
+#### Inference Mode
+
+Classify images with an already trained model, one job per image. With no
+options it uses the hosted model and the 10 hosted sample images
+(`<base-url>/inference/00.jpg` … `09.jpg`):
 
 ```bash
-# Standard mode
-pegasus-plan --submit -s condorpool -o local workflow.yml
+./workflow_generator.py --mode inference --output workflow.yml
+```
 
-# DPU mode
-pegasus-plan --submit -s edgepool -s cloudpool -o local workflow.yml
+To use the model from a training run and your own images (files, directories or
+URLs):
+
+```bash
+./workflow_generator.py \
+    --mode inference \
+    --model-dir ./output \
+    --inference-images ./new_field_images \
+    --output workflow.yml
+```
+
+### 5. Choose Where It Runs
+
+The workflow itself names no scheduler. Each job states only cores, memory
+and a wall-clock `runtime`, and the `train_classifier` job carries the Pegasus
+tag `train`. Everything site-specific goes in `sites.yml`, which the generator
+manages through `custom_sites.py` (the same module as in airquality-workflow)
+using these rules, most specific first:
+
+1. **A `sites.yml` entry you provided** for the execution site is kept
+   untouched, whether you wrote it by hand or with `custom_sites.py`.
+2. **A hosted catalog** named in `~/.pegasusrc`
+   ([pegasushub/pegasus-site-catalogs](https://github.com/pegasushub/pegasus-site-catalogs/tree/main/conf),
+   e.g. ACCESS or Unity) is used as-is, and Pegasus merges `sites.yml` over it.
+3. **Otherwise, an HTCondor site is added.** With no options at all, the
+   generator writes `condorpool` plus a `local` site with output in `./output`.
+
+Only the execution site's entry is ever written, plus `local` if it is
+missing. Other entries in `sites.yml` are kept.
+
+**HTCondor pool (default):**
+
+```bash
+./workflow_generator.py
+```
+
+**Slurm cluster**, training on a GPU partition:
+
+```bash
+./workflow_generator.py -e compute --site-style slurm \
+    --queue cpu --project my_lab --site-scratch /scratch/$USER/crophealth \
+    --gpu --train-profile pegasus:queue=gpu      # train_classifier only
+```
+
+**Hosted catalog (ACCESS, Unity):**
+
+```bash
+echo "pegasus.catalog.site.repo.file = unity.yml" >> ~/.pegasusrc
+./workflow_generator.py -e compute --site-style slurm --project my_lab
+```
+
+On ACCESS the setup notebook already names the hosted catalog in
+`~/.pegasusrc`; `Access-CropHealth-workflow.ipynb` detects it and plans against
+`compute`.
+
+Against a hosted catalog, `--site-style slurm` writes only your overrides
+(account, queue, profiles) plus the site's submission style, rather than a
+whole site. A style that contradicts the hosted catalog is rejected. A site
+the hosted catalog does not define (e.g. `-e condorpool --site-style condor`
+next to a hosted `compute`) gets a complete entry instead; without
+`--site-style`, the generator warns that planning against it will fail.
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-e, --execution-site` | `compute` with a hosted catalog, else `condorpool` | Site to plan against. Hosted catalogs call theirs `compute`. |
+| `--site-style` | `auto` | `auto`: keep what exists, else add an HTCondor site. `condor`/`slurm`: (re)write this site's entry. `none`: don't touch `sites.yml`. |
+| `--queue`, `--project` | — | Partition and account on a batch site (`pegasus.queue`, `pegasus.project`). |
+| `--site-scratch` | `./work` | Slurm: shared scratch visible to the workers and the submit host. |
+| `--site-profile NS:KEY=VALUE` | — | Any other site profile, e.g. `pegasus:glite.arguments=--constraint=avx512`. Repeatable. |
+| `--train-profile NS:KEY=VALUE` | — | Profiles for the `train` tag only (`train_classifier`), e.g. `pegasus:queue=gpu` or `pegasus:runtime=43200`. Repeatable. |
+| `--shared-filesystem` | `auto` | Let jobs read inputs, including the `.sif`, straight from the submit host (`pegasus.transfer.bypass.input.staging`). `auto` turns it on for Slurm/glite sites and off for HTCondor. |
+| `--sites-yml` | `sites.yml` | Site catalog file, named in the generated `pegasus.properties`. |
+
+`./custom_sites.py` runs the same logic on its own, for preparing a
+`sites.yml` once and reusing it (`./custom_sites.py --help`).
+
+Notes:
+
+- **Slurm submission** goes through HTCondor's glite/BLAHP, so plan on the
+  cluster's login node with HTCondor and Pegasus installed.
+- **Tags** (`train`, and `x-tags` in `sites.yml`) need Pegasus 6.0
+  (or 5.1.3dev) at plan time. Older planners ignore them.
+- **Runtime budgets** (`TOOL_RUNTIME` in `workflow_generator.py`) are
+  generous: 6 h for training and 15–60 min for everything else. Batch sites
+  kill a job that exceeds its budget; condor pools ignore it. Raise training's
+  with `--train-profile pegasus:runtime=<seconds>` for long CPU-only runs.
+- **Worker package.** When `pegasus-version` is on the PATH, the generator
+  stages a container-compatible Pegasus worker package (`rhel_8`, matched to
+  that version) as `pegasus::worker` and turns off downloading inside jobs.
+  This works whatever the submit host's OS or Pegasus build is, and without
+  curl in the image.
+- **Container bind.** On batch sites the container binds the workflow
+  directory, because staged inputs are symlinks into it and PegasusLite starts
+  containers with `--no-home`. Without the bind, every job fails with
+  kickstart "Unable to execute the specified binary" (exit 127). This bind is
+  never added on a condor pool.
+
+### 6. Submit
+
+```bash
+pegasus-plan --submit -s condorpool -o local workflow.yml
 
 # Monitor
 pegasus-status <run_directory>
 ```
 
-### 6. View Results
+Use the site you generated for: the generator prints the exact command.
+
+### 7. View Results
 
 ```
 output/
@@ -359,22 +476,28 @@ Note: You must accept the dataset terms at https://www.kaggle.com/datasets/emmar
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--data-source` | Image source (local, kaggle, sample) | sample |
+| `--mode` | `full`, `train` or `inference` | full |
+| `--data-source` | Training image source (local, kaggle, sample, remote) | sample |
+| `--base-url` | Hosted inputs for `remote` data and `inference` mode | https://download.pegasus.isi.edu/tutorial/crophealth |
 | `--image-dir` | Local image directory | - |
 | `--kaggle-dataset` | Kaggle dataset name | emmarex/plantdisease |
 | `--image-size` | Target image size | 224 |
 | `--train-split` | Training fraction | 0.8 |
 | `--epochs` | Training epochs | 20 |
 | `--batch-size` | Training batch size | 32 |
+| `--gpu` | Request a GPU for `train_classifier` | False |
+| `-e, --execution-site` | Execution site; see [Choose Where It Runs](#5-choose-where-it-runs) for the other site options | compute with a hosted catalog, else condorpool |
+| `--container-sif` | Apptainer image | Apptainer/CropHealth_Container.sif |
 | `-o, --output` | Output workflow file | workflow.yml |
 
-### DPU / Edge-to-Cloud Arguments
+### Inference Mode Arguments
 
 | Argument | Description | Default |
 |----------|-------------|---------|
-| `--enable-dpu` | Enable edge-to-cloud architecture | False |
-| `--edge-site` | Edge execution site name | edgepool |
-| `--cloud-site` | Cloud execution site name | cloudpool |
+| `--model-dir` | Directory with `disease_classifier.pt` and `training_info.json` | model at `--base-url` |
+| `--inference-images` | Images to classify: files, directories or URLs | hosted samples |
+| `--num-remote-images` | Hosted samples to use when `--inference-images` is not given | 10 |
+| `--gpu-inference` | Request a GPU for each classify job | False |
 
 ## Supported Diseases
 
@@ -496,7 +619,8 @@ Interactive HTML report with:
 
 ### Training with GPU
 
-For GPU-accelerated training:
+In a workflow, pass `--gpu` to the generator: the `train_classifier` job then
+requests a GPU and uses CUDA. To train by hand:
 
 ```bash
 ./bin/train_classifier.py \
@@ -515,7 +639,7 @@ ghcr.io publishing recipe. Point the generator at a different image with
 
 ### Using Pre-trained Model
 
-For inference only:
+As a workflow, use [Inference Mode](#inference-mode). By hand:
 
 ```bash
 ./bin/classify_disease.py \
@@ -543,9 +667,9 @@ For inference only:
 - Ensure sufficient training data (100+ images per class)
 - Try data augmentation
 
-**4. DPU jobs not running**
-- Verify edge workers have `+has_dpu = True` ClassAd
-- Check HTCondor pool configuration
+**4. Inference `merge` job fails with "No successful predictions"**
+- Every classify job failed to read its image; check the per-image
+  `*_predictions.json` files for the `error` field
 
 ### Debugging
 
