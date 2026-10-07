@@ -3,33 +3,50 @@
 """
 Crop Health Workflow Generator for Pegasus WMS.
 
-Creates a workflow for:
-1. Fetching/organizing crop images
-2. Preprocessing images for ML
-3. Training disease classification model
-4. Running inference on new images
-5. Evaluating classification accuracy
-6. Generating health reports
+Three modes (--mode):
 
-Supports standard single-site execution and edge-to-cloud DPU architecture.
+  full (default)  fetch -> preprocess -> train -> classify -> evaluate -> report
+  train           [fetch ->] preprocess -> train
+  inference       classify (one job per image, in parallel) -> merge -> report
+
+train and inference follow the ACCESS Pegasus tutorials (05-Tutorial-ML-Training
+and 06-Tutorial-ML-Inference): a model is trained once, then reused over and
+over on new images. With --data-source remote the training inputs come from
+--base-url instead of a fetch job; inference takes the model from --model-dir
+or --base-url, and the images from --inference-images or --base-url.
 
 Usage:
-    # Standard workflow with local images
-    ./workflow_generator.py --image-dir ./field_images --output workflow.yml
+    # Full pipeline with local images
+    ./workflow_generator.py --data-source local --image-dir ./field_images
 
-    # Edge-to-cloud with DPU
-    ./workflow_generator.py --image-dir ./field_images --enable-dpu \
-        --edge-site edgepool --cloud-site cloudpool --output workflow.yml
+    # Train on the hosted tutorial dataset, requesting a GPU
+    ./workflow_generator.py --mode train --data-source remote --gpu
+
+    # Inference with the hosted model over the 10 hosted sample images
+    ./workflow_generator.py --mode inference
+
+    # Inference with a locally trained model over your own images
+    ./workflow_generator.py --mode inference --model-dir ./output \
+        --inference-images ./new_images/*.jpg
 """
 
 import argparse
 import logging
 import os
+import re
+import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
 from Pegasus.api import *
+
+# Site-catalog handling shared with the standalone custom_sites.py script.
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
+from custom_sites import (  # noqa: E402
+    HOSTED_SITE, STYLES, TRAIN_TAG, ensure_sites_yml, hosted_catalog,
+    parse_profile,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,68 +54,115 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Hosted inputs used by the ACCESS Pegasus tutorials: crop_catalog.csv,
+# images.tar.gz, disease_classifier.pt, training_info.json, inference/NN.jpg
+DEFAULT_BASE_URL = "https://download.pegasus.isi.edu/tutorial/crophealth"
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif"}
+
+# Execution site when -e is not given: hosted catalogs (pegasushub
+# pegasus-site-catalogs, named in ~/.pegasusrc) call their site HOSTED_SITE
+# ("compute"); with no hosted catalog the generator adds an HTCondor one.
+DEFAULT_SITE = "condorpool"
+
+# Wall-clock budget per tool, in seconds. Batch sites (Slurm through glite)
+# kill a job that exceeds it, so the values are generous; condor pools ignore
+# them. Everything else about where a job runs — scheduler, partition,
+# account, scratch, GPUs for "train" — belongs in the site catalog (see
+# custom_sites.py).
+TOOL_RUNTIME = {
+    "fetch_crop_images": 3600,
+    "preprocess_images": 3600,
+    "train_classifier": 6 * 3600,
+    "classify_disease": 3600,
+    "evaluate_accuracy": 900,
+    "merge_predictions": 900,
+    "generate_report": 1800,
+}
+
+# Pegasus worker package (kickstart etc.) used *inside* the container, which
+# is Debian 13 (python:3.10.21-slim) whatever the submit host runs. rhel_8 is
+# built against glibc 2.28, so it runs on any newer glibc (trixie has 2.41),
+# and it is PegasusLite's own fallback. Change this with the container's base
+# image.
+WORKER_PACKAGE_PLATFORM = "x86_64_rhel_8"
+WORKER_PACKAGE_URL = ("https://download.pegasus.isi.edu/pegasus/{v}/"
+                      "pegasus-worker-{v}-" + WORKER_PACKAGE_PLATFORM + ".tar.gz")
+
+
+def planner_version():
+    """Version of the pegasus-plan that will plan this workflow, or None."""
+    try:
+        out = subprocess.run(["pegasus-version"], capture_output=True,
+                             text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    version = out.stdout.strip()
+    return version if out.returncode == 0 and version else None
+
 
 class CropHealthWorkflow:
     """Generate Pegasus workflow for crop disease detection."""
 
     wf = None
-    sc = None
     tc = None
     rc = None
     props = None
 
     dagfile = None
     wf_dir = None
-    shared_scratch_dir = None
     local_storage_dir = None
     wf_name = "crophealth"
+    worker_package_url = None
 
     def __init__(self, dagfile="workflow.yml"):
         """Initialize workflow."""
         self.dagfile = dagfile
         self.wf_dir = str(Path(__file__).parent.resolve())
-        self.shared_scratch_dir = os.path.join(self.wf_dir, "scratch")
         self.local_storage_dir = os.path.join(self.wf_dir, "output")
 
     def write(self):
         """Write all catalogs and workflow to files."""
-        if self.sc is not None:
-            self.sc.write()
         self.props.write()
         self.rc.write()
         self.tc.write()
         self.wf.write(file=self.dagfile)
 
-    def create_pegasus_properties(self):
-        """Create Pegasus properties configuration."""
+    def create_pegasus_properties(self, sites_yml="sites.yml",
+                                  bypass_input_staging=False):
+        """Planner properties.
+
+        The site catalog itself is custom_sites.py's business; naming an
+        existing sites.yml here lets pegasus-plan find it from any directory.
+        """
         self.props = Properties()
         self.props["pegasus.transfer.threads"] = "16"
-
-    def create_sites_catalog(self, exec_site_name="condorpool"):
-        """Create site catalog."""
-        logger.info(f"Creating site catalog for execution site: {exec_site_name}")
-        self.sc = SiteCatalog()
-
-        local = Site("local").add_directories(
-            Directory(
-                Directory.SHARED_SCRATCH, self.shared_scratch_dir
-            ).add_file_servers(
-                FileServer("file://" + self.shared_scratch_dir, Operation.ALL)
-            ),
-            Directory(
-                Directory.LOCAL_STORAGE, self.local_storage_dir
-            ).add_file_servers(
-                FileServer("file://" + self.local_storage_dir, Operation.ALL)
-            ),
-        )
-
-        exec_site = (
-            Site(exec_site_name)
-            .add_condor_profile(universe="vanilla")
-            .add_pegasus_profile(style="condor")
-        )
-
-        self.sc.add_sites(local, exec_site)
+        # Jobs run inside a Debian 13 container, whatever the submit host is.
+        # Left alone, PegasusLite ships the submit host's worker package and,
+        # on a mismatch, downloads another from inside the container — which
+        # fails where the image has no curl/wget (an unprivileged --fakeroot
+        # build on a cluster cannot apt-get them), and the submit host's
+        # kickstart may need a newer glibc than the image has. So stage the
+        # container-compatible package named in the transformation catalog
+        # (create_transformation_catalog) and never download. strict=false
+        # covers the host side, where that package is only used to transfer.
+        if self.worker_package_url:
+            self.props["pegasus.transfer.worker.package"] = "true"
+            self.props["pegasus.transfer.worker.package.strict"] = "false"
+            self.props["pegasus.transfer.worker.package.autodownload"] = "false"
+        # Symlink rather than copy when an input already sits on the
+        # execution site. A no-op otherwise, so always on.
+        self.props["pegasus.transfer.links"] = "true"
+        if bypass_input_staging:
+            # Jobs read inputs (notably the .sif image) straight from the
+            # submit host's paths instead of through the staging site. Only
+            # valid where workers share a filesystem with the submit host —
+            # a Slurm cluster, typically; not a condor pool staging over
+            # HTCondor file transfer.
+            self.props["pegasus.transfer.bypass.input.staging"] = "true"
+        if os.path.isfile(sites_yml):
+            self.props["pegasus.catalog.site"] = "YAML"
+            self.props["pegasus.catalog.site.file"] = os.path.abspath(sites_yml)
 
     def create_replica_catalog(self):
         """Create replica catalog for input files."""
@@ -107,10 +171,24 @@ class CropHealthWorkflow:
 
     def create_transformation_catalog(
         self,
-        exec_site_name="condorpool",
         container_sif="Apptainer/CropHealth_Container.sif",
+        gpu=False,
+        bind_workflow_dir=False,
+        large_memory="32 GB",
     ):
-        """Create transformation catalog with executables and containers."""
+        """Containers and transformations; nothing here names a site.
+
+        bind_workflow_dir: on a site that stages through its own filesystem
+        (a Slurm cluster, a hosted catalog) or with bypass staging,
+        pegasus.transfer.links stages inputs as symlinks to absolute paths
+        under the workflow directory. PegasusLite starts the container with
+        --no-home and binds only the job directory, so those links dangle
+        inside it and every job dies with kickstart "Unable to execute the
+        specified binary" (exit 127). Binding the workflow directory at its
+        own path makes them resolve. Never on a condor pool: inputs arrive
+        there as copies and the directory does not exist on the workers, so
+        the bind would fail every job.
+        """
         logger.info("Creating transformation catalog")
         self.tc = TransformationCatalog()
 
@@ -135,72 +213,86 @@ class CropHealthWorkflow:
             image="file://" + sif_path,
             image_site="local",
         )
+        if bind_workflow_dir:
+            crophealth_container.add_pegasus_profile(
+                container_arguments=f"--bind {self.wf_dir}")
 
-        # Add transformations
-        fetch_crop_images = Transformation(
-            "fetch_crop_images",
-            site=exec_site_name,
-            pfn=os.path.join(self.wf_dir, "fetch_crop_images.py"),
-            is_stageable=True,
-            container=crophealth_container,
-        ).add_pegasus_profile(memory="4 GB")
+        # Scripts live on the submit host, so they are registered on "local"
+        # and staged to whatever site the planner picks.
+        def tool(name, script, memory):
+            return Transformation(
+                name,
+                site="local",
+                pfn=os.path.join(self.wf_dir, script),
+                is_stageable=True,
+                container=crophealth_container,
+            ).add_pegasus_profile(
+                cores=1, memory=memory, runtime=TOOL_RUNTIME[name]
+            )
 
-        preprocess_images = Transformation(
-            "preprocess_images",
-            site=exec_site_name,
-            pfn=os.path.join(self.wf_dir, "bin/preprocess_images.py"),
-            is_stageable=True,
-            container=crophealth_container,
-        ).add_pegasus_profile(memory="32 GB")
-
-        train_classifier = Transformation(
-            "train_classifier",
-            site=exec_site_name,
-            pfn=os.path.join(self.wf_dir, "bin/train_classifier.py"),
-            is_stageable=True,
-            container=crophealth_container,
-        ).add_pegasus_profile(memory="32 GB")
-
-        classify_disease = Transformation(
-            "classify_disease",
-            site=exec_site_name,
-            pfn=os.path.join(self.wf_dir, "bin/classify_disease.py"),
-            is_stageable=True,
-            container=crophealth_container,
-        ).add_pegasus_profile(memory="32 GB")
-
-        evaluate_accuracy = Transformation(
-            "evaluate_accuracy",
-            site=exec_site_name,
-            pfn=os.path.join(self.wf_dir, "bin/evaluate_accuracy.py"),
-            is_stageable=True,
-            container=crophealth_container,
-        ).add_pegasus_profile(memory="4 GB")
-
-        generate_report = Transformation(
-            "generate_report",
-            site=exec_site_name,
-            pfn=os.path.join(self.wf_dir, "bin/generate_report.py"),
-            is_stageable=True,
-            container=crophealth_container,
-        ).add_pegasus_profile(memory="32 GB")
+        fetch_crop_images = tool("fetch_crop_images", "fetch_crop_images.py", "4 GB")
+        # preprocess and train hold the whole dataset in memory: about 22 GB
+        # peak for the 9k-image tutorial set at 224 px, ~7 GB at 128 px
+        preprocess_images = tool("preprocess_images", "bin/preprocess_images.py", large_memory)
+        train_classifier = tool("train_classifier", "bin/train_classifier.py", large_memory)
+        # train_classifier.py uses CUDA whenever the job lands on a GPU
+        if gpu:
+            train_classifier.add_pegasus_profile(gpus="1")
+        # classify reads one image at a time; report reads only predictions
+        classify_disease = tool("classify_disease", "bin/classify_disease.py", "8 GB")
+        evaluate_accuracy = tool("evaluate_accuracy", "bin/evaluate_accuracy.py", "4 GB")
+        merge_predictions = tool("merge_predictions", "bin/merge_predictions.py", "2 GB")
+        generate_report = tool("generate_report", "bin/generate_report.py", "4 GB")
 
         self.tc.add_containers(crophealth_container)
+        if self.worker_package_url:
+            self.tc.add_transformations(
+                Transformation(
+                    "worker",
+                    namespace="pegasus",
+                    site="local",
+                    pfn=self.worker_package_url,
+                    is_stageable=True,
+                    arch=Arch.X86_64,
+                    os_type=OS.LINUX,
+                )
+            )
         self.tc.add_transformations(
             fetch_crop_images,
             preprocess_images,
             train_classifier,
             classify_disease,
             evaluate_accuracy,
+            merge_predictions,
             generate_report,
         )
 
+    def add_input(self, lfn, location):
+        """Register an input in the replica catalog: a URL or a local path."""
+        if re.match(r"^[a-z]+://", location):
+            self.rc.add_replica("remote", lfn, location)
+        else:
+            self.rc.add_replica("local", lfn, "file://" + os.path.abspath(location))
+
     def create_workflow(self, args):
-        """Create the complete workflow."""
-        logger.info("Creating workflow")
+        """Create the workflow for the selected --mode."""
+        logger.info(f"Creating workflow (mode: {args.mode})")
         self.wf = Workflow(self.wf_name)
 
-        # Output file names
+        if args.mode == "inference":
+            self.add_inference_jobs(args)
+            return
+
+        catalog_file, images_archive, train_job, model_checkpoint, training_info = (
+            self.add_training_jobs(args)
+        )
+        if args.mode == "full":
+            self.add_evaluation_jobs(
+                train_job, catalog_file, images_archive, model_checkpoint, training_info
+            )
+
+    def add_training_jobs(self, args):
+        """Add [fetch ->] preprocess -> train. Returns the files later jobs need."""
         catalog_file = File("crop_catalog.csv")
         images_archive = File("images.tar.gz")
         train_data = File("train_data.npz")
@@ -209,17 +301,60 @@ class CropHealthWorkflow:
         preprocessing_info = File("preprocessing_info.json")
         model_checkpoint = File("disease_classifier.pt")
         training_info = File("training_info.json")
-        predictions_file = File("predictions.json")
-        accuracy_results = File("accuracy_results.json")
-        report_html = File("report.html")
-        report_summary = File("report_summary.json")
-        disease_distribution_png = File("disease_distribution.png")
-        severity_distribution_png = File("severity_distribution.png")
-        crop_health_summary_png = File("crop_health_summary.png")
-        confidence_histogram_png = File("confidence_histogram.png")
-        confusion_matrix_png = File("confusion_matrix.png")
 
-        # Job 1: Fetch/catalog images
+        fetch_job = None
+        if args.data_source == "remote":
+            # Pre-hosted inputs, as in the ACCESS tutorial: no fetch job
+            base_url = args.base_url.rstrip("/")
+            self.add_input(catalog_file, f"{base_url}/{catalog_file.lfn}")
+            self.add_input(images_archive, f"{base_url}/{images_archive.lfn}")
+        else:
+            fetch_job = self.create_fetch_job(args, catalog_file, images_archive)
+
+        # Preprocess images
+        preprocess_job = Job("preprocess_images", _id="preprocess", node_label="preprocess")
+        preprocess_job.add_args(
+            "--input", catalog_file,
+            "--output-dir", ".",
+            "--image-size", str(args.image_size),
+            "--split", str(args.train_split),
+            "--images-archive", images_archive,
+        )
+        preprocess_job.add_inputs(catalog_file, images_archive)
+        preprocess_job.add_outputs(train_data, stage_out=True, register_replica=False)
+        preprocess_job.add_outputs(val_data, stage_out=True, register_replica=False)
+        preprocess_job.add_outputs(label_mapping, stage_out=True, register_replica=False)
+        preprocess_job.add_outputs(preprocessing_info, stage_out=True, register_replica=False)
+        preprocess_job.add_pegasus_profile(label="preprocess")
+
+        # Train classifier
+        train_job = Job("train_classifier", _id="train", node_label="train")
+        train_job.add_args(
+            "--input-dir", ".",
+            "--output-dir", ".",
+            "--epochs", str(args.epochs),
+            "--batch-size", str(args.batch_size),
+        )
+        train_job.add_inputs(train_data, val_data, label_mapping)
+        train_job.add_outputs(model_checkpoint, stage_out=True, register_replica=False)
+        train_job.add_outputs(training_info, stage_out=True, register_replica=False)
+        train_job.add_pegasus_profile(label="train")
+        # Site-tunable via the site catalog's "train" tag (GPU partition,
+        # longer runtime, ...): see custom_sites.py --train.
+        # (add_profiles, not add_pegasus_profile(tag=...): the keyword only
+        # exists in Pegasus >= 5.1.3dev's Python API.)
+        train_job.add_profiles(Namespace.PEGASUS, key="tag", value=TRAIN_TAG)
+
+        self.wf.add_jobs(preprocess_job, train_job)
+        if fetch_job is not None:
+            self.wf.add_jobs(fetch_job)
+            self.wf.add_dependency(fetch_job, children=[preprocess_job])
+        self.wf.add_dependency(preprocess_job, children=[train_job])
+
+        return catalog_file, images_archive, train_job, model_checkpoint, training_info
+
+    def create_fetch_job(self, args, catalog_file, images_archive):
+        """Create the job that fetches/catalogs images (local, kaggle, sample)."""
         fetch_job = Job("fetch_crop_images", _id="fetch_images", node_label="fetch_images")
         fetch_job.add_args(
             "--source", args.data_source,
@@ -260,37 +395,16 @@ class CropHealthWorkflow:
         fetch_job.add_outputs(catalog_file, stage_out=True, register_replica=False)
         fetch_job.add_outputs(images_archive, stage_out=False, register_replica=False)
         fetch_job.add_pegasus_profile(label="fetch")
+        return fetch_job
 
-        # Job 2: Preprocess images
-        preprocess_job = Job("preprocess_images", _id="preprocess", node_label="preprocess")
-        preprocess_job.add_args(
-            "--input", catalog_file,
-            "--output-dir", ".",
-            "--image-size", str(args.image_size),
-            "--split", str(args.train_split),
-            "--images-archive", images_archive,
-        )
-        preprocess_job.add_inputs(catalog_file, images_archive)
-        preprocess_job.add_outputs(train_data, stage_out=True, register_replica=False)
-        preprocess_job.add_outputs(val_data, stage_out=True, register_replica=False)
-        preprocess_job.add_outputs(label_mapping, stage_out=True, register_replica=False)
-        preprocess_job.add_outputs(preprocessing_info, stage_out=True, register_replica=False)
-        preprocess_job.add_pegasus_profile(label="preprocess")
+    def add_evaluation_jobs(
+        self, train_job, catalog_file, images_archive, model_checkpoint, training_info
+    ):
+        """Full mode: classify the whole archive -> evaluate -> report."""
+        predictions_file = File("predictions.json")
+        accuracy_results = File("accuracy_results.json")
 
-        # Job 3: Train classifier
-        train_job = Job("train_classifier", _id="train", node_label="train")
-        train_job.add_args(
-            "--input-dir", ".",
-            "--output-dir", ".",
-            "--epochs", str(args.epochs),
-            "--batch-size", str(args.batch_size),
-        )
-        train_job.add_inputs(train_data, val_data, label_mapping)
-        train_job.add_outputs(model_checkpoint, stage_out=True, register_replica=False)
-        train_job.add_outputs(training_info, stage_out=True, register_replica=False)
-        train_job.add_pegasus_profile(label="train")
-
-        # Job 4: Classify diseases
+        # Classify diseases
         classify_job = Job("classify_disease", _id="classify", node_label="classify")
         classify_job.add_args(
             "--model-dir", ".",
@@ -302,7 +416,7 @@ class CropHealthWorkflow:
         classify_job.add_outputs(predictions_file, stage_out=True, register_replica=False)
         classify_job.add_pegasus_profile(label="classify")
 
-        # Job 5: Evaluate accuracy
+        # Evaluate accuracy
         evaluate_job = Job("evaluate_accuracy", _id="evaluate", node_label="evaluate")
         evaluate_job.add_args(
             "--predictions", predictions_file,
@@ -313,47 +427,164 @@ class CropHealthWorkflow:
         evaluate_job.add_outputs(accuracy_results, stage_out=True, register_replica=False)
         evaluate_job.add_pegasus_profile(label="evaluate")
 
-        # Job 6: Generate report
+        report_job = self.create_report_job(predictions_file, accuracy_results)
+
+        self.wf.add_jobs(classify_job, evaluate_job, report_job)
+        self.wf.add_dependency(train_job, children=[classify_job])
+        self.wf.add_dependency(classify_job, children=[evaluate_job])
+        self.wf.add_dependency(evaluate_job, children=[report_job])
+
+    def add_inference_jobs(self, args):
+        """Inference mode: one classify job per image -> merge -> report."""
+        model_checkpoint = File("disease_classifier.pt")
+        training_info = File("training_info.json")
+        base_url = args.base_url.rstrip("/")
+
+        # A model trained earlier (e.g. by --mode train), or the hosted one
+        model_location = args.model_dir or base_url
+        for f in (model_checkpoint, training_info):
+            self.add_input(f, f"{model_location.rstrip('/')}/{f.lfn}")
+
+        images = resolve_inference_images(args)
+        logger.info(f"Inference over {len(images)} images")
+
+        predictions_file = File("predictions.json")
+        merge_job = Job("merge_predictions", _id="merge", node_label="merge")
+        merge_job.add_args("--output", predictions_file)
+        merge_job.add_outputs(predictions_file, stage_out=True, register_replica=False)
+        merge_job.add_pegasus_profile(label="merge")
+
+        used_ids = set()
+        for location in images:
+            name = location.rstrip("/").rsplit("/", 1)[-1]
+            # Job IDs and prediction LFNs come from the sanitized stem, which
+            # can collide (a.jpg / a.png, "a b.jpg" / a_b.jpg): suffix those
+            stem = re.sub(r"[^A-Za-z0-9_-]", "_", Path(name).stem)
+            image_id, n = stem, 1
+            while image_id in used_ids:
+                n += 1
+                image_id = f"{stem}_{n}"
+            used_ids.add(image_id)
+
+            image_file = File(name)
+            self.add_input(image_file, location)
+            image_predictions = File(f"{image_id}_predictions.json")
+
+            classify_job = Job(
+                "classify_disease", _id=f"classify_{image_id}", node_label=f"classify_{image_id}"
+            )
+            classify_job.add_args(
+                "--model-dir", ".",
+                "--input", image_file,
+                "--output", image_predictions,
+            )
+            classify_job.add_inputs(model_checkpoint, training_info, image_file)
+            classify_job.add_outputs(image_predictions, stage_out=True, register_replica=False)
+            # One image needs far less than the whole-archive classify job
+            classify_job.add_pegasus_profile(label="classify", cores="1", memory="4 GB")
+            if args.gpu_inference:
+                classify_job.add_pegasus_profile(gpus="1")
+
+            merge_job.add_args(image_predictions)
+            merge_job.add_inputs(image_predictions)
+            self.wf.add_jobs(classify_job)
+            self.wf.add_dependency(classify_job, children=[merge_job])
+
+        report_job = self.create_report_job(predictions_file)
+        self.wf.add_jobs(merge_job, report_job)
+        self.wf.add_dependency(merge_job, children=[report_job])
+
+    def create_report_job(self, predictions_file, accuracy_results=None):
+        """Create the report job; the confusion matrix needs accuracy results."""
+        outputs = [
+            "report.html",
+            "report_summary.json",
+            "disease_distribution.png",
+            "severity_distribution.png",
+            "crop_health_summary.png",
+            "confidence_histogram.png",
+        ]
+
         report_job = Job("generate_report", _id="report", node_label="report")
         report_job.add_args(
             "--predictions", predictions_file,
             "--output-dir", ".",
             "--format", "all",
-            "--accuracy", accuracy_results,
         )
-        report_job.add_inputs(predictions_file, accuracy_results)
-        report_job.add_outputs(report_html, stage_out=True, register_replica=False)
-        report_job.add_outputs(report_summary, stage_out=True, register_replica=False)
-        report_job.add_outputs(disease_distribution_png, stage_out=True, register_replica=False)
-        report_job.add_outputs(severity_distribution_png, stage_out=True, register_replica=False)
-        report_job.add_outputs(crop_health_summary_png, stage_out=True, register_replica=False)
-        report_job.add_outputs(confidence_histogram_png, stage_out=True, register_replica=False)
-        report_job.add_outputs(confusion_matrix_png, stage_out=True, register_replica=False)
+        report_job.add_inputs(predictions_file)
+        if accuracy_results is not None:
+            report_job.add_args("--accuracy", accuracy_results)
+            report_job.add_inputs(accuracy_results)
+            outputs.append("confusion_matrix.png")
+        for lfn in outputs:
+            report_job.add_outputs(File(lfn), stage_out=True, register_replica=False)
         report_job.add_pegasus_profile(label="report")
-
-        # Add jobs to workflow
-        self.wf.add_jobs(fetch_job, preprocess_job, train_job, classify_job, evaluate_job, report_job)
-
-        # Define dependencies
-        self.wf.add_dependency(fetch_job, children=[preprocess_job])
-        self.wf.add_dependency(preprocess_job, children=[train_job])
-        self.wf.add_dependency(train_job, children=[classify_job])
-        self.wf.add_dependency(classify_job, children=[evaluate_job])
-        self.wf.add_dependency(evaluate_job, children=[report_job])
+        return report_job
 
 
-def main():
+def resolve_inference_images(args):
+    """Return image locations (URLs or local paths) for inference mode."""
+    if not args.inference_images:
+        base_url = args.base_url.rstrip("/")
+        return [
+            f"{base_url}/inference/{i:02d}.jpg" for i in range(args.num_remote_images)
+        ]
+
+    images = []
+    for entry in args.inference_images:
+        if os.path.isdir(entry):
+            images.extend(
+                str(p) for p in sorted(Path(entry).rglob("*"))
+                if p.suffix.lower() in IMAGE_EXTENSIONS
+            )
+        elif re.match(r"^[a-z]+://", entry) or os.path.isfile(entry):
+            images.append(entry)
+        else:
+            raise ValueError(f"Inference image not found: {entry}")
+    if not images:
+        raise ValueError("No images found in --inference-images")
+
+    # Each image becomes an LFN, so names must be unique across the inputs
+    names = [i.rstrip("/").rsplit("/", 1)[-1] for i in images]
+    duplicates = sorted({n for n in names if names.count(n) > 1})
+    if duplicates:
+        raise ValueError(f"Duplicate image file names: {', '.join(duplicates)}")
+    return images
+
+
+def build_parser():
+    """Build the command-line parser (also used by the ACCESS notebook)."""
     parser = argparse.ArgumentParser(
         description="Generate Pegasus workflow for crop disease detection"
+    )
+
+    # Mode
+    parser.add_argument(
+        "--mode",
+        type=str,
+        choices=["full", "train", "inference"],
+        default="full",
+        help="full: train and evaluate end to end; train: preprocess + train "
+             "only; inference: classify images with an already trained model"
     )
 
     # Data source
     parser.add_argument(
         "--data-source",
         type=str,
-        choices=["local", "kaggle", "sample"],
+        choices=["local", "kaggle", "sample", "remote"],
         default="sample",
-        help="Source of image data"
+        help="Source of training images (full/train modes). remote uses the "
+             "crop_catalog.csv and images.tar.gz hosted at --base-url"
+    )
+
+    parser.add_argument(
+        "--base-url",
+        type=str,
+        default=DEFAULT_BASE_URL,
+        help="Where hosted inputs live: catalog and image archive for "
+             "--data-source remote; model and inference/NN.jpg images for "
+             f"--mode inference (default: {DEFAULT_BASE_URL})"
     )
 
     parser.add_argument(
@@ -398,12 +629,130 @@ def main():
         help="Training batch size"
     )
 
-    # Execution site
+    # Inference
     parser.add_argument(
-        "-e", "--execution-site-name",
+        "--model-dir",
         type=str,
-        default="condorpool",
-        help="HTCondor pool name for execution"
+        help="Directory with disease_classifier.pt and training_info.json from "
+             "a training run (inference mode; default: the model at --base-url)"
+    )
+
+    parser.add_argument(
+        "--inference-images",
+        nargs="+",
+        help="Images to classify in inference mode: local files, directories "
+             "or URLs (default: the hosted samples at --base-url/inference/)"
+    )
+
+    parser.add_argument(
+        "--num-remote-images",
+        type=int,
+        default=10,
+        help="How many hosted sample images (00.jpg, 01.jpg, ...) to classify "
+             "when --inference-images is not given; the default --base-url "
+             "hosts 10 (default: 10)"
+    )
+
+    parser.add_argument(
+        "--large-memory",
+        type=str,
+        default="32 GB",
+        help="Memory for preprocess_images and train_classifier, which hold "
+             "the whole dataset in memory (default: 32 GB; '12 GB' fits the "
+             "tutorial dataset at --image-size 128 on a 16 GB slot)"
+    )
+
+    # GPUs
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="Request a GPU for the train_classifier job"
+    )
+
+    parser.add_argument(
+        "--gpu-inference",
+        action="store_true",
+        help="Request a GPU for each per-image classify job (inference mode)"
+    )
+
+    # Execution site. The workflow states only cores/memory/runtime and a
+    # "train" tag; these options shape the site catalog (custom_sites.py).
+    parser.add_argument(
+        "-e", "--execution-site", "--execution-site-name",
+        dest="execution_site",
+        type=str,
+        default=None,
+        help="Site to plan against (default: 'compute' when ~/.pegasusrc "
+             "names a hosted catalog such as ACCESS or Unity, which call "
+             "their site that; otherwise 'condorpool')"
+    )
+
+    parser.add_argument(
+        "--site-style",
+        choices=("auto",) + STYLES + ("none",),
+        default="auto",
+        help="How the execution site is described in sites.yml. auto (default): "
+             "keep a sites.yml entry or hosted catalog if one exists, else add "
+             "an HTCondor site. condor/slurm: (re)write that site's entry. "
+             "none: leave sites.yml alone."
+    )
+
+    parser.add_argument(
+        "--queue",
+        metavar="PARTITION",
+        help="Batch partition/queue jobs submit to (required for "
+             "--site-style slurm without a hosted catalog)"
+    )
+
+    parser.add_argument(
+        "--project",
+        metavar="ACCOUNT",
+        help="Allocation/account charged on a batch site"
+    )
+
+    parser.add_argument(
+        "--site-scratch",
+        metavar="DIR",
+        help="Slurm only: shared scratch visible to workers and the submit "
+             "host (default: ./work)"
+    )
+
+    parser.add_argument(
+        "--site-profile",
+        action="append",
+        default=[],
+        type=parse_profile,
+        metavar="NS:KEY=VALUE",
+        help="Extra profile on the execution site, e.g. "
+             "pegasus:glite.arguments=--constraint=avx512; repeatable"
+    )
+
+    parser.add_argument(
+        "--train-profile",
+        action="append",
+        default=[],
+        type=parse_profile,
+        metavar="NS:KEY=VALUE",
+        help="Profile for the train_classifier job only (the 'train' tag), "
+             "e.g. pegasus:queue=gpu or pegasus:runtime=43200; repeatable"
+    )
+
+    parser.add_argument(
+        "--shared-filesystem",
+        choices=("auto", "yes", "no"),
+        default="auto",
+        help="Let jobs read inputs (incl. the container image) directly from "
+             "the submit host instead of via staging. auto (default): on for a "
+             "Slurm site, off for HTCondor, which stages over file transfer."
+    )
+
+    parser.add_argument(
+        "--sites-yml",
+        metavar="FILE",
+        type=str,
+        default="sites.yml",
+        help="Local site catalog (default: sites.yml). Named in the generated "
+             "properties, so pegasus-plan finds it from any directory."
     )
 
     # Container
@@ -423,36 +772,115 @@ def main():
         help="Output workflow file"
     )
 
-    args = parser.parse_args()
+    return parser
 
-    # Validate
-    if args.data_source == "local" and not args.image_dir:
-        logger.error("--image-dir required for local data source")
-        sys.exit(1)
 
-    # Generate workflow
+def setup_site_catalog(args, wf_dir):
+    """Ensure the site catalog can plan args.execution_site; return its style.
+
+    Defaults work untouched (an HTCondor site is added if nothing defines
+    the requested one), a sites.yml or hosted catalog someone provided wins,
+    and --site-style/--queue/--project/... tailor it for a batch cluster.
+    """
+    action, style = ensure_sites_yml(
+        args.sites_yml, args.execution_site, wf_dir,
+        style=args.site_style, queue=args.queue, project=args.project,
+        scratch=args.site_scratch, profiles=args.site_profile,
+        train=args.train_profile)
+    hosted = hosted_catalog()
+    logger.info(f"Site catalog: {args.sites_yml}: {action}"
+                + (f" (merged over hosted {hosted})" if hosted else ""))
+    if style is None and hosted:
+        logger.info(f"  The hosted catalog {hosted} decides how {args.execution_site!r} "
+                    "submits; hosted catalogs name their site 'compute'.")
+        if args.execution_site != HOSTED_SITE:
+            # Nothing was written for this site, so planning works only if
+            # the hosted catalog happens to define it.
+            logger.warning(
+                f"  {args.execution_site!r} is not defined in {args.sites_yml} and "
+                f"hosted catalogs normally define only {HOSTED_SITE!r}: pegasus-plan "
+                f"will fail unless {hosted} has it. Use -e {HOSTED_SITE}, or "
+                f"--site-style condor/slurm to describe {args.execution_site!r}.")
+    return style
+
+
+def generate(args):
+    """Validate args, then build and write the workflow and its catalogs."""
+    if args.execution_site is None:
+        args.execution_site = HOSTED_SITE if hosted_catalog() else DEFAULT_SITE
+    if args.mode != "inference" and args.data_source == "local" and not args.image_dir:
+        raise ValueError("--image-dir required for local data source")
+    if args.mode == "inference":
+        if args.model_dir:
+            missing = [
+                f for f in ("disease_classifier.pt", "training_info.json")
+                if not os.path.exists(os.path.join(args.model_dir, f))
+            ]
+            if missing:
+                raise ValueError(
+                    f"--model-dir {args.model_dir} is missing: {', '.join(missing)}"
+                )
+        if not args.inference_images and args.num_remote_images < 1:
+            raise ValueError("--num-remote-images must be at least 1")
+
+    workflow = CropHealthWorkflow(dagfile=args.output)
+
+    style = setup_site_catalog(args, workflow.wf_dir)
+    if args.shared_filesystem == "auto":
+        bypass = style is not None and style != "condor"
+    else:
+        bypass = args.shared_filesystem == "yes"
+    # A site that is not a condor pool stages through its own filesystem (an
+    # unknown style over a hosted catalog counts: hosted catalogs are batch
+    # sites), and then staged inputs are symlinks into wf_dir.
+    batch_site = (style not in (None, "condor")
+                  or (style is None and hosted_catalog() is not None))
+    bind_wf = batch_site or bypass
+    logger.info(f"Input staging: {'bypassed (shared filesystem)' if bypass else 'via staging site'}"
+                + (f"; containers bind {workflow.wf_dir}" if bind_wf else ""))
+
+    version = planner_version()
+    if version:
+        workflow.worker_package_url = WORKER_PACKAGE_URL.format(v=version)
+        logger.info(f"Worker package: {WORKER_PACKAGE_PLATFORM} for Pegasus {version} "
+                    "(staged into the container, no in-job download)")
+    else:
+        logger.warning("pegasus-version not found; Pegasus will pick the "
+                       "container's worker package itself (needs curl/wget in "
+                       "the image and internet on the workers)")
+
+    workflow.create_pegasus_properties(
+        sites_yml=args.sites_yml, bypass_input_staging=bypass)
+    workflow.create_replica_catalog()
+    workflow.create_transformation_catalog(
+        container_sif=args.container_sif,
+        gpu=args.gpu,
+        bind_workflow_dir=bind_wf,
+        large_memory=args.large_memory,
+    )
+    workflow.create_workflow(args)
+    workflow.write()
+    return workflow
+
+
+def main():
+    args = build_parser().parse_args()
+
     try:
-        workflow = CropHealthWorkflow(dagfile=args.output)
-        workflow.create_pegasus_properties()
-        workflow.create_sites_catalog(exec_site_name=args.execution_site_name)
-        workflow.create_replica_catalog()
-        workflow.create_transformation_catalog(
-            exec_site_name=args.execution_site_name,
-            container_sif=args.container_sif
-        )
-        workflow.create_workflow(args)
-        workflow.write()
+        generate(args)
 
         logger.info("\n" + "=" * 70)
         logger.info("WORKFLOW GENERATION COMPLETE")
         logger.info("=" * 70)
         logger.info(f"  Workflow file: {args.output}")
-        logger.info(f"  Data source: {args.data_source}")
-        logger.info(f"  Image size: {args.image_size}")
-        logger.info(f"  Training epochs: {args.epochs}")
+        logger.info(f"  Mode: {args.mode}")
+        if args.mode != "inference":
+            logger.info(f"  Data source: {args.data_source}")
+            logger.info(f"  Image size: {args.image_size}")
+            logger.info(f"  Training epochs: {args.epochs}")
         logger.info("\nNext steps:")
         logger.info(f"  1. Review workflow: {args.output}")
-        logger.info(f"  2. Submit workflow: pegasus-plan --submit -s {args.execution_site_name} -o local {args.output}")
+        logger.info(f"  2. Submit workflow: pegasus-plan --submit -s {args.execution_site} -o local {args.output}")
         logger.info(f"  3. Monitor status:  pegasus-status <submit_dir>")
         logger.info("=" * 70 + "\n")
 

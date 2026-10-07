@@ -8,11 +8,15 @@ This is a **Pegasus WMS workflow** for detecting and classifying crop diseases f
 
 ## Architecture
 
-The workflow is a linear DAG with 6 jobs:
+`workflow_generator.py --mode` selects the DAG (`train`/`inference` mirror the ACCESS Pegasus tutorials 05-Tutorial-ML-Training and 06-Tutorial-ML-Inference):
 
 ```
-fetch_images → preprocess → train → classify → evaluate → report
+full (default):  fetch_images → preprocess → train → classify → evaluate → report
+train:           [fetch_images →] preprocess → train
+inference:       classify_<img> (one per image, parallel) → merge → report
 ```
+
+`--data-source remote` replaces the fetch job with the catalog/archive hosted at `--base-url` (default `https://download.pegasus.isi.edu/tutorial/crophealth`). Inference takes the model from `--model-dir` or `--base-url`, and images from `--inference-images` (files/dirs/URLs) or `<base-url>/inference/NN.jpg`. Inference has no ground truth, so no evaluate job and no confusion matrix.
 
 - **`workflow_generator.py`** — Generates the Pegasus workflow YAML (`workflow.yml`) using `Pegasus.api`. This is the entry point for creating the workflow.
 - **`fetch_crop_images.py`** — Fetches/catalogs images from local disk, Kaggle, or sample data; outputs `crop_catalog.csv` + `images.tar.gz`.
@@ -20,13 +24,14 @@ fetch_images → preprocess → train → classify → evaluate → report
 - **`bin/train_classifier.py`** — Trains PyTorch CNN (transfer learning); outputs `disease_classifier.pt`.
 - **`bin/classify_disease.py`** — Runs inference; outputs `predictions.json`.
 - **`bin/evaluate_accuracy.py`** — Computes per-class precision/recall/F1 and confusion matrix; outputs `accuracy_results.json`.
+- **`bin/merge_predictions.py`** — Inference mode: merges per-image `*_predictions.json` into `predictions.json`.
 - **`bin/generate_report.py`** — Generates HTML report + PNG charts.
 
-All jobs run inside a Singularity container pulled from `kthare10/crophealth:latest` (Docker Hub). The container is multi-platform (amd64/arm64).
+- **`custom_sites.py`** — Site-catalog logic (`ensure_sites_yml`), shared with airquality-workflow; imported by the generator and runnable standalone.
 
-### Edge-to-Cloud (DPU) Mode
+**Sites**: the workflow is site-agnostic. Transformations are registered on `local` with cores/memory/`runtime` (`TOOL_RUNTIME`); `train_classifier` carries the tag `train`. `sites.yml` precedence: an existing entry, then a hosted catalog from `~/.pegasusrc` (site `compute`, also the default `-e` when one is configured), then a default HTCondor `condorpool`; `local` is always ensured. Over a hosted catalog, `--site-style` writes an overlay only for a site the catalog defines, a full entry otherwise. `--site-style slurm --queue --project` targets batch clusters; there `--shared-filesystem auto` turns on bypass staging and the container binds the workflow dir. With `pegasus-version` available, a `rhel_8` `pegasus::worker` package is staged into the Debian 13 (trixie) container.
 
-`--enable-dpu` splits the workflow across two HTCondor pools: `edgepool` (I/O-bound fetch/preprocess) and `cloudpool` (compute-bound train/classify/evaluate/report). Jobs targeting DPU workers require HTCondor ClassAd `+has_dpu = True`.
+All jobs run inside an Apptainer image, `Apptainer/CropHealth_Container.sif` by default (`--container-sif`), built locally and staged by Pegasus; see `APPTAINER.md`.
 
 ## Common Commands
 
@@ -57,13 +62,21 @@ pip install -r requirements.txt
 # Kaggle dataset
 ./workflow_generator.py --data-source kaggle --kaggle-dataset emmarex/plantdisease --image-size 128 --epochs 10 --output workflow.yml
 
-# Edge-to-cloud DPU mode
-./workflow_generator.py --data-source local --image-dir ./field_images --enable-dpu --edge-site edgepool --cloud-site cloudpool --output workflow.yml
+# Train only, on the hosted tutorial dataset, with a GPU
+./workflow_generator.py --mode train --data-source remote --gpu --output workflow.yml
+
+# Inference: hosted model over the 10 hosted sample images
+./workflow_generator.py --mode inference --output workflow.yml
+
+# Inference: your trained model over your images
+./workflow_generator.py --mode inference --model-dir ./output --inference-images ./new_images --output workflow.yml
+# Slurm instead of the default HTCondor site
+./workflow_generator.py -e compute --site-style slurm --queue <partition> --project <account> --train-profile pegasus:queue=<gpu-partition>
 ```
 
 ### Submit and monitor with Pegasus
 ```bash
-pegasus-plan --submit -s condorpool -o local workflow.yml
+pegasus-plan --submit -s condorpool -o local workflow.yml   # use the site you generated for
 pegasus-status <run_directory>
 pegasus-analyzer <run_directory>
 ```
@@ -92,6 +105,7 @@ Also accept dataset terms at `https://www.kaggle.com/datasets/emmarex/plantdisea
 | File | Purpose |
 |------|---------|
 | `workflow_generator.py` | Pegasus DAG generator; defines all job dependencies and resource requirements |
+| `custom_sites.py` | Writes `sites.yml` (HTCondor / Slurm / hosted-catalog overlay) |
 | `fetch_crop_images.py` | Image sourcing; `DISEASE_INFO` dict maps folder names to metadata |
 | `crop_catalog.csv` | Sample catalog shipped with repo |
 | `Docker/CropHealth_Dockerfile` | Multi-platform container definition |
