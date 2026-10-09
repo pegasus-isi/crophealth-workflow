@@ -115,7 +115,7 @@ apptainer build Apptainer/CropHealth_Container.sif \
     --output workflow.yml
 
 # Plan and submit to a plain HTCondor pool (the generator never submits)
-pegasus-plan --dir submit -s condorpool -o local --submit workflow.yml
+pegasus-plan --dir submit -s condorpool -o local --output-dir "$PWD/output" --submit workflow.yml
 
 # Monitor
 pegasus-status <run_directory>
@@ -361,7 +361,7 @@ Pegasus version.
 
 ```bash
 ./workflow_generator.py -s access-pegasus.yml
-pegasus-plan --dir submit -s compute -o local --submit workflow.yml
+pegasus-plan --dir submit -s compute -o local --output-dir "$PWD/output" --submit workflow.yml
 ```
 
 **Hosted catalog, once per user**: the ACCESS setup notebook (`00-Setup`) names
@@ -382,10 +382,11 @@ no built-in `compute`, but it provides a default `condorpool` site, so:
 
 ```bash
 ./workflow_generator.py -e condorpool
-pegasus-plan --dir submit -s condorpool -o local --submit workflow.yml
+pegasus-plan --dir submit -s condorpool -o local --output-dir "$PWD/output" --submit workflow.yml
 ```
 
-Outputs from a CLI run land in Pegasus's default local storage, `./wf-output/`.
+Outputs land in `./output/`: the printed plan command passes `--output-dir`
+(otherwise Pegasus's built-in `local` site would use `./wf-output/`).
 `Access-CropHealth-workflow.ipynb` runs the same generator code (`build_parser()`
 and `generate()`), writes a local HTCondor `compute` site with
 `create_sites_catalog()` when no hosted catalog is set (outputs in
@@ -413,7 +414,7 @@ The generator writes the workflow and catalogs and prints this command; it
 never submits by itself. Use the `-e` value you generated with as `-s`:
 
 ```bash
-pegasus-plan --dir submit -s compute -o local --submit workflow.yml
+pegasus-plan --dir submit -s compute -o local --output-dir "$PWD/output" --submit workflow.yml
 
 # Monitor
 pegasus-status <run_directory>

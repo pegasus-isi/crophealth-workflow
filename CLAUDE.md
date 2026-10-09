@@ -77,7 +77,7 @@ pip install -r requirements.txt
 
 ### Submit and monitor with Pegasus
 ```bash
-pegasus-plan --dir submit -s compute -o local --submit workflow.yml   # -s = the -e value
+pegasus-plan --dir submit -s compute -o local --output-dir "$PWD/output" --submit workflow.yml   # -s = the -e value
 pegasus-status <run_directory>
 pegasus-analyzer <run_directory>
 ```

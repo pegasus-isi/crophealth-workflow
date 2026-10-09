@@ -765,7 +765,10 @@ def main():
             logger.info(f"  Training epochs: {args.epochs}")
         logger.info("\nNext steps:")
         logger.info(f"  1. Review workflow: {args.output}")
-        logger.info(f"  2. Plan and submit: pegasus-plan --dir submit -s {args.execution_site_name} -o local --submit {args.output}")
+        # --output-dir: no site catalog defines "local", so Pegasus's built-in local
+        # site would otherwise stage outputs to ./wf-output.
+        logger.info(f"  2. Plan and submit: pegasus-plan --dir submit -s {args.execution_site_name} -o local "
+                    f"--output-dir {os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")} --submit {args.output}")
         logger.info(f"  3. Monitor status:  pegasus-status <submit_dir>")
         logger.info("=" * 70 + "\n")
 
