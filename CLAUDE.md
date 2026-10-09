@@ -27,9 +27,9 @@ inference:       classify_<img> (one per image, parallel) → merge → report
 - **`bin/merge_predictions.py`** — Inference mode: merges per-image `*_predictions.json` into `predictions.json`.
 - **`bin/generate_report.py`** — Generates HTML report + PNG charts.
 
-- **`custom_sites.py`** — Site-catalog logic (`ensure_sites_yml`), shared with airquality-workflow; imported by the generator and runnable standalone.
+- **`Access-CropHealth-workflow.ipynb`** — Notebook: builds the CLI's argv, calls `build_parser()`/`generate(args, sites_catalog=...)` from the generator (no copied workflow code), submits from an explicit cell via `plan_submit()`.
 
-**Sites**: the workflow is site-agnostic. Transformations are registered on `local` with cores/memory/`runtime` (`TOOL_RUNTIME`); `train_classifier` carries the tag `train`. `sites.yml` precedence: an existing entry, then a hosted catalog named with `-s FILE` (written to `pegasus.properties`) or in `~/.pegasusrc` (site `compute`), then a default HTCondor site; `-e` always defaults to `compute`; `local` is always ensured. Over a hosted catalog, `--site-style` writes an overlay only for a site the catalog defines, a full entry otherwise. `--site-style slurm --queue --project` targets batch clusters; there `--shared-filesystem auto` turns on bypass staging and the container binds the workflow dir. With `pegasus-version` available, a `rhel_8` `pegasus::worker` package is staged into the Debian 13 (trixie) container.
+**Sites** (pegasus-isi/pegasus-gromacs pattern): the CLI writes no site catalog and never submits — it prints the `pegasus-plan` command. Jobs run on `-e compute` (default), defined by a hosted catalog named with `-s FILE` (written to `pegasus.properties`) or in `~/.pegasusrc`; `-e condorpool` on a plain HTCondor pool with no catalog. `create_sites_catalog()` (local + HTCondor `compute`) is a placeholder only the notebook uses (`generate(args, sites_catalog=True)`). Transformations are registered on the execution site with cores/memory; `train_classifier` states a 6 h `runtime`. `--gpu`/`--gpu-inference` jobs request a GPU and carry the hosted catalogs' `gpu` tag.
 
 All jobs run inside an Apptainer image, `Apptainer/CropHealth_Container.sif` by default (`--container-sif`), built locally and staged by Pegasus; see `APPTAINER.md`.
 
@@ -70,13 +70,14 @@ pip install -r requirements.txt
 
 # Inference: your trained model over your images
 ./workflow_generator.py --mode inference --model-dir ./output --inference-images ./new_images --output workflow.yml
-# Slurm instead of the default HTCondor site
-./workflow_generator.py -e compute --site-style slurm --queue <partition> --project <account> --train-profile pegasus:queue=<gpu-partition>
+# A hosted site catalog (or one in ~/.pegasusrc) / a plain HTCondor pool
+./workflow_generator.py -s unity.yml --gpu
+./workflow_generator.py -e condorpool
 ```
 
 ### Submit and monitor with Pegasus
 ```bash
-pegasus-plan --submit -s compute -o local workflow.yml   # use the site you generated for
+pegasus-plan --dir submit -s compute -o local --submit workflow.yml   # -s = the -e value
 pegasus-status <run_directory>
 pegasus-analyzer <run_directory>
 ```
@@ -105,7 +106,7 @@ Also accept dataset terms at `https://www.kaggle.com/datasets/emmarex/plantdisea
 | File | Purpose |
 |------|---------|
 | `workflow_generator.py` | Pegasus DAG generator; defines all job dependencies and resource requirements |
-| `custom_sites.py` | Writes `sites.yml` (HTCondor / Slurm / hosted-catalog overlay) |
+| `Access-CropHealth-workflow.ipynb` | Notebook driving the generator's `build_parser()`/`generate()` |
 | `fetch_crop_images.py` | Image sourcing; `DISEASE_INFO` dict maps folder names to metadata |
 | `crop_catalog.csv` | Sample catalog shipped with repo |
 | `Docker/CropHealth_Dockerfile` | Multi-platform container definition |

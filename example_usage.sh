@@ -112,8 +112,9 @@ echo "=== Generating standard workflow ==="
     --batch-size 32 \
     --output workflow.yml
 
-# Submit to HTCondor
-# pegasus-plan --submit -s compute -o local workflow.yml
+# Plan and submit (the generator never submits; -s = its -e value: compute
+# with a hosted site catalog, condorpool on a plain HTCondor pool)
+# pegasus-plan --dir submit -s compute -o local --submit workflow.yml
 
 # ==============================================================================
 # Generate Pegasus Workflow (Edge-to-Cloud DPU Mode)
