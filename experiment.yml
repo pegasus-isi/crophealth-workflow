@@ -112,7 +112,7 @@ experiments:
       set -e
       source $(dirname $(realpath ./workflow_generator.py))/secrets/kaggle.sh
       ./workflow_generator.py --data-source kaggle --kaggle-dataset emmarex/plantdisease --image-size 128 --epochs 10 --output workflow.yml
-      pegasus-plan -s condorpool -o local workflow.yml
+      pegasus-plan -s compute -o local workflow.yml
 
     # Workflow is submitted from the submit node
     submit_node_labels:

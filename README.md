@@ -114,7 +114,7 @@ apptainer build Apptainer/CropHealth_Container.sif \
     --output workflow.yml
 
 # Submit to HTCondor
-pegasus-plan --submit -s condorpool -o local workflow.yml
+pegasus-plan --submit -s compute -o local workflow.yml
 
 # Monitor
 pegasus-status <run_directory>
@@ -356,11 +356,16 @@ using these rules, most specific first:
 
 1. **A `sites.yml` entry you provided** for the execution site is kept
    untouched, whether you wrote it by hand or with `custom_sites.py`.
-2. **A hosted catalog** named in `~/.pegasusrc`
+2. **A hosted catalog**
    ([pegasushub/pegasus-site-catalogs](https://github.com/pegasushub/pegasus-site-catalogs/tree/main/conf),
-   e.g. ACCESS or Unity) is used as-is, and Pegasus merges `sites.yml` over it.
+   e.g. ACCESS or Unity), named with `-s access-pegasus.yml` (written to
+   `pegasus.properties`) or in `~/.pegasusrc`, is used as-is, and Pegasus
+   merges `sites.yml` over it.
 3. **Otherwise, an HTCondor site is added.** With no options at all, the
-   generator writes `condorpool` plus a `local` site with output in `./output`.
+   generator writes `compute` plus a `local` site with output in `./output`.
+
+The execution site is always called `compute` by default, the name hosted
+catalogs give their site, so `pegasus-plan -s compute` works either way.
 
 Only the execution site's entry is ever written, plus `local` if it is
 missing. Other entries in `sites.yml` are kept.
@@ -399,7 +404,8 @@ next to a hosted `compute`) gets a complete entry instead; without
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-e, --execution-site` | `compute` with a hosted catalog, else `condorpool` | Site to plan against. Hosted catalogs call theirs `compute`. |
+| `-e, --execution-site` | `compute` | Site to plan against. Hosted catalogs call theirs `compute`. |
+| `-s, --hosted-site-catalog` | `~/.pegasusrc`'s, if any | Hosted catalog to plan against, e.g. `access-pegasus.yml`; written to `pegasus.properties`. |
 | `--site-style` | `auto` | `auto`: keep what exists, else add an HTCondor site. `condor`/`slurm`: (re)write this site's entry. `none`: don't touch `sites.yml`. |
 | `--queue`, `--project` | — | Partition and account on a batch site (`pegasus.queue`, `pegasus.project`). |
 | `--site-scratch` | `./work` | Slurm: shared scratch visible to the workers and the submit host. |
@@ -435,7 +441,7 @@ Notes:
 ### 6. Submit
 
 ```bash
-pegasus-plan --submit -s condorpool -o local workflow.yml
+pegasus-plan --submit -s compute -o local workflow.yml
 
 # Monitor
 pegasus-status <run_directory>
@@ -486,7 +492,7 @@ Note: You must accept the dataset terms at https://www.kaggle.com/datasets/emmar
 | `--epochs` | Training epochs | 20 |
 | `--batch-size` | Training batch size | 32 |
 | `--gpu` | Request a GPU for `train_classifier` | False |
-| `-e, --execution-site` | Execution site; see [Choose Where It Runs](#5-choose-where-it-runs) for the other site options | compute with a hosted catalog, else condorpool |
+| `-e, --execution-site` | Execution site; see [Choose Where It Runs](#5-choose-where-it-runs) for the other site options | compute |
 | `--container-sif` | Apptainer image | Apptainer/CropHealth_Container.sif |
 | `-o, --output` | Output workflow file | workflow.yml |
 

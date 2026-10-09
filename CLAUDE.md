@@ -29,7 +29,7 @@ inference:       classify_<img> (one per image, parallel) → merge → report
 
 - **`custom_sites.py`** — Site-catalog logic (`ensure_sites_yml`), shared with airquality-workflow; imported by the generator and runnable standalone.
 
-**Sites**: the workflow is site-agnostic. Transformations are registered on `local` with cores/memory/`runtime` (`TOOL_RUNTIME`); `train_classifier` carries the tag `train`. `sites.yml` precedence: an existing entry, then a hosted catalog from `~/.pegasusrc` (site `compute`, also the default `-e` when one is configured), then a default HTCondor `condorpool`; `local` is always ensured. Over a hosted catalog, `--site-style` writes an overlay only for a site the catalog defines, a full entry otherwise. `--site-style slurm --queue --project` targets batch clusters; there `--shared-filesystem auto` turns on bypass staging and the container binds the workflow dir. With `pegasus-version` available, a `rhel_8` `pegasus::worker` package is staged into the Debian 13 (trixie) container.
+**Sites**: the workflow is site-agnostic. Transformations are registered on `local` with cores/memory/`runtime` (`TOOL_RUNTIME`); `train_classifier` carries the tag `train`. `sites.yml` precedence: an existing entry, then a hosted catalog named with `-s FILE` (written to `pegasus.properties`) or in `~/.pegasusrc` (site `compute`), then a default HTCondor site; `-e` always defaults to `compute`; `local` is always ensured. Over a hosted catalog, `--site-style` writes an overlay only for a site the catalog defines, a full entry otherwise. `--site-style slurm --queue --project` targets batch clusters; there `--shared-filesystem auto` turns on bypass staging and the container binds the workflow dir. With `pegasus-version` available, a `rhel_8` `pegasus::worker` package is staged into the Debian 13 (trixie) container.
 
 All jobs run inside an Apptainer image, `Apptainer/CropHealth_Container.sif` by default (`--container-sif`), built locally and staged by Pegasus; see `APPTAINER.md`.
 
@@ -76,7 +76,7 @@ pip install -r requirements.txt
 
 ### Submit and monitor with Pegasus
 ```bash
-pegasus-plan --submit -s condorpool -o local workflow.yml   # use the site you generated for
+pegasus-plan --submit -s compute -o local workflow.yml   # use the site you generated for
 pegasus-status <run_directory>
 pegasus-analyzer <run_directory>
 ```
