@@ -111,10 +111,11 @@ apptainer build Apptainer/CropHealth_Container.sif \
     --kaggle-dataset emmarex/plantdisease \
     --image-size 128 \
     --epochs 10 \
+    -e condorpool \
     --output workflow.yml
 
-# Submit to HTCondor
-pegasus-plan --submit -s condorpool -o local workflow.yml
+# Plan and submit to a plain HTCondor pool (the generator never submits)
+pegasus-plan --dir submit -s condorpool -o local --output-dir "$PWD/output" --submit workflow.yml
 
 # Monitor
 pegasus-status <run_directory>
@@ -184,7 +185,7 @@ Now you can use the Kaggle data source:
 ```
 crophealth-workflow/
 ├── workflow_generator.py          # Workflow generator (full / train / inference modes)
-├── custom_sites.py                # Site catalog (sites.yml): HTCondor, Slurm, hosted
+├── Access-CropHealth-workflow.ipynb # Notebook driving the same generator code
 ├── fetch_crop_images.py           # Image fetcher/catalog creator
 ├── example_usage.sh               # Example usage script
 ├── bin/
@@ -348,100 +349,76 @@ URLs):
 
 ### 5. Choose Where It Runs
 
-The workflow itself names no scheduler. Each job states only cores, memory
-and a wall-clock `runtime`, and the `train_classifier` job carries the Pegasus
-tag `train`. Everything site-specific goes in `sites.yml`, which the generator
-manages through `custom_sites.py` (the same module as in airquality-workflow)
-using these rules, most specific first:
+Where jobs run depends on your resource provider and allocation, so it lives in
+a site catalog you choose, never in the generator, which writes no site
+catalog. Jobs run on a site named `compute` (`-e`, the default), the one site
+every centrally hosted catalog
+([pegasushub/pegasus-site-catalogs](https://github.com/pegasushub/pegasus-site-catalogs/tree/main/conf))
+defines; `pegasus-plan` downloads the catalog from the branch matching its
+Pegasus version.
 
-1. **A `sites.yml` entry you provided** for the execution site is kept
-   untouched, whether you wrote it by hand or with `custom_sites.py`.
-2. **A hosted catalog** named in `~/.pegasusrc`
-   ([pegasushub/pegasus-site-catalogs](https://github.com/pegasushub/pegasus-site-catalogs/tree/main/conf),
-   e.g. ACCESS or Unity) is used as-is, and Pegasus merges `sites.yml` over it.
-3. **Otherwise, an HTCondor site is added.** With no options at all, the
-   generator writes `condorpool` plus a `local` site with output in `./output`.
-
-Only the execution site's entry is ever written, plus `local` if it is
-missing. Other entries in `sites.yml` are kept.
-
-**HTCondor pool (default):**
+**Hosted catalog, per workflow** (e.g. ACCESS Pegasus, Unity):
 
 ```bash
-./workflow_generator.py
+./workflow_generator.py -s access-pegasus.yml
+pegasus-plan --dir submit -s compute -o local --output-dir "$PWD/output" --submit workflow.yml
 ```
 
-**Slurm cluster**, training on a GPU partition:
+**Hosted catalog, once per user**: the ACCESS setup notebook (`00-Setup`) names
+the catalog and your allocation in `~/.pegasusrc`; elsewhere add them yourself,
+then generate with no `-s`:
 
 ```bash
-./workflow_generator.py -e compute --site-style slurm \
-    --queue cpu --project my_lab --site-scratch /scratch/$USER/crophealth \
-    --gpu --train-profile pegasus:queue=gpu      # train_classifier only
+cat >> ~/.pegasusrc <<'EOF'
+pegasus.catalog.site.repo.file = unity.yml
+env.RESOURCE_USERNAME = jdoe
+env.RESOURCE_PROJECT = my_lab
+EOF
+./workflow_generator.py --gpu       # train_classifier gets the catalogs' "gpu" tag
 ```
 
-**Hosted catalog (ACCESS, Unity):**
+**Plain HTCondor pool with no site catalog** (e.g. a FABRIC slice): Pegasus has
+no built-in `compute`, but it provides a default `condorpool` site, so:
 
 ```bash
-echo "pegasus.catalog.site.repo.file = unity.yml" >> ~/.pegasusrc
-./workflow_generator.py -e compute --site-style slurm --project my_lab
+./workflow_generator.py -e condorpool
+pegasus-plan --dir submit -s condorpool -o local --output-dir "$PWD/output" --submit workflow.yml
 ```
 
-On ACCESS the setup notebook already names the hosted catalog in
-`~/.pegasusrc`; `Access-CropHealth-workflow.ipynb` detects it and plans against
-`compute`.
-
-Against a hosted catalog, `--site-style slurm` writes only your overrides
-(account, queue, profiles) plus the site's submission style, rather than a
-whole site. A style that contradicts the hosted catalog is rejected. A site
-the hosted catalog does not define (e.g. `-e condorpool --site-style condor`
-next to a hosted `compute`) gets a complete entry instead; without
-`--site-style`, the generator warns that planning against it will fail.
+Outputs land in `./output/`: the printed plan command passes `--output-dir`
+(otherwise Pegasus's built-in `local` site would use `./wf-output/`).
+`Access-CropHealth-workflow.ipynb` runs the same generator code (`build_parser()`
+and `generate()`), writes a local HTCondor `compute` site with
+`create_sites_catalog()` when no hosted catalog is set (outputs in
+`./output/`), and submits from an explicit cell.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `-e, --execution-site` | `compute` with a hosted catalog, else `condorpool` | Site to plan against. Hosted catalogs call theirs `compute`. |
-| `--site-style` | `auto` | `auto`: keep what exists, else add an HTCondor site. `condor`/`slurm`: (re)write this site's entry. `none`: don't touch `sites.yml`. |
-| `--queue`, `--project` | — | Partition and account on a batch site (`pegasus.queue`, `pegasus.project`). |
-| `--site-scratch` | `./work` | Slurm: shared scratch visible to the workers and the submit host. |
-| `--site-profile NS:KEY=VALUE` | — | Any other site profile, e.g. `pegasus:glite.arguments=--constraint=avx512`. Repeatable. |
-| `--train-profile NS:KEY=VALUE` | — | Profiles for the `train` tag only (`train_classifier`), e.g. `pegasus:queue=gpu` or `pegasus:runtime=43200`. Repeatable. |
-| `--shared-filesystem` | `auto` | Let jobs read inputs, including the `.sif`, straight from the submit host (`pegasus.transfer.bypass.input.staging`). `auto` turns it on for Slurm/glite sites and off for HTCondor. |
-| `--sites-yml` | `sites.yml` | Site catalog file, named in the generated `pegasus.properties`. |
-
-`./custom_sites.py` runs the same logic on its own, for preparing a
-`sites.yml` once and reusing it (`./custom_sites.py --help`).
+| `-s, --hosted-site-catalog` | (none; `~/.pegasusrc` if set) | Hosted catalog to plan against, e.g. `access-pegasus.yml`, `unity.yml`; written to `pegasus.properties`. |
+| `-e, --execution-site-name` | `compute` | Execution site name; `condorpool` on a plain HTCondor pool with no site catalog. |
 
 Notes:
 
 - **Slurm submission** goes through HTCondor's glite/BLAHP, so plan on the
   cluster's login node with HTCondor and Pegasus installed.
-- **Tags** (`train`, and `x-tags` in `sites.yml`) need Pegasus 6.0
-  (or 5.1.3dev) at plan time. Older planners ignore them.
-- **Runtime budgets** (`TOOL_RUNTIME` in `workflow_generator.py`) are
-  generous: 6 h for training and 15–60 min for everything else. Batch sites
-  kill a job that exceeds its budget; condor pools ignore it. Raise training's
-  with `--train-profile pegasus:runtime=<seconds>` for long CPU-only runs.
-- **Worker package.** When `pegasus-version` is on the PATH, the generator
-  stages a container-compatible Pegasus worker package (`rhel_8`, matched to
-  that version) as `pegasus::worker` and turns off downloading inside jobs.
-  This works whatever the submit host's OS or Pegasus build is, and without
-  curl in the image.
-- **Container bind.** On batch sites the container binds the workflow
-  directory, because staged inputs are symlinks into it and PegasusLite starts
-  containers with `--no-home`. Without the bind, every job fails with
-  kickstart "Unable to execute the specified binary" (exit 127). This bind is
-  never added on a condor pool.
+- **GPU jobs** (`--gpu`, `--gpu-inference`) request one GPU and carry the
+  Pegasus tag `gpu`, which hosted catalogs map to their GPU partition. Tags
+  need Pegasus 6.0 (or 5.1.3dev) at plan time.
+- **Runtime.** Training states a 6 h budget (`TRAIN_CLASSIFIER_RUNTIME`),
+  since it can outlast a hosted batch catalog's default (2 h on Unity); every
+  other step uses the catalog's default.
 
-### 6. Submit
+### 6. Plan and Submit
+
+The generator writes the workflow and catalogs and prints this command; it
+never submits by itself. Use the `-e` value you generated with as `-s`:
 
 ```bash
-pegasus-plan --submit -s condorpool -o local workflow.yml
+pegasus-plan --dir submit -s compute -o local --output-dir "$PWD/output" --submit workflow.yml
 
 # Monitor
 pegasus-status <run_directory>
 ```
-
-Use the site you generated for: the generator prints the exact command.
 
 ### 7. View Results
 
@@ -486,7 +463,8 @@ Note: You must accept the dataset terms at https://www.kaggle.com/datasets/emmar
 | `--epochs` | Training epochs | 20 |
 | `--batch-size` | Training batch size | 32 |
 | `--gpu` | Request a GPU for `train_classifier` | False |
-| `-e, --execution-site` | Execution site; see [Choose Where It Runs](#5-choose-where-it-runs) for the other site options | compute with a hosted catalog, else condorpool |
+| `-s, --hosted-site-catalog` | Hosted site catalog, e.g. `access-pegasus.yml`; see [Choose Where It Runs](#5-choose-where-it-runs) | none (`~/.pegasusrc`) |
+| `-e, --execution-site-name` | Execution site; `condorpool` on a plain HTCondor pool with no site catalog | compute |
 | `--container-sif` | Apptainer image | Apptainer/CropHealth_Container.sif |
 | `-o, --output` | Output workflow file | workflow.yml |
 
